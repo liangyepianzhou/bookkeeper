@@ -48,3 +48,8 @@ build/
 .gradle/
 *.log
 *.dat
+
+### BROKK'S CONFIGURATION ###
+.brokk/**
+!.brokk/style.md
+!.brokk/project.properties
