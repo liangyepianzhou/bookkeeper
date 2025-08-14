@@ -356,36 +356,60 @@ public class RackawareEnsemblePlacementPolicyImpl extends TopologyAwareEnsembleP
 
     /*
      * this method should be called in readlock scope of 'rwLock'
-     */
+/**
+ * 如果强制要求写入副本需要分布在多个机架(rack)，则将默认机架（defaultRack）的所有 bookie
+ * 加入到排除列表（excludeBookies）中，以确保写入副本不会全部落在默认机架上。
+ *
+ * @param excludeBookies 当前已经需要排除的 BookieId 集合
+ * @return 在 enforceMinNumRacksPerWriteQuorum 打开时，返回加上 defaultRack 上的所有 bookie 的排除集合，否则返回原始 excludeBookies
+ */
     protected Set<BookieId> addDefaultRackBookiesIfMinNumRacksIsEnforced(
             Set<BookieId> excludeBookies) {
+
+        // 定义综合后的排除 bookie 集合，后续会返回
         Set<BookieId> comprehensiveExclusionBookiesSet;
+
+        // 判断是否开启了"写入副本需跨越多个 rack"的强制策略
         if (enforceMinNumRacksPerWriteQuorum) {
             Set<BookieId> bookiesInDefaultRack = null;
+
+            // 获取默认 rack 下所有叶子节点
             Set<Node> defaultRackLeaves = topology.getLeaves(getDefaultRack());
+
+            // 遍历叶子节点，寻找属于默认 rack 的 BookieNode
             for (Node node : defaultRackLeaves) {
                 if (node instanceof BookieNode) {
+                    // 延迟初始化集合，当遇到第一个 BookieNode 时初始化并复制 excludeBookies
                     if (bookiesInDefaultRack == null) {
                         bookiesInDefaultRack = new HashSet<BookieId>(excludeBookies);
                     }
+                    // 将该 bookie 的地址加入到排除集合
                     bookiesInDefaultRack.add(((BookieNode) node).getAddr());
                 } else {
+                    // 如果叶子节点不是 BookieNode，则记录错误日志
                     LOG.error("found non-BookieNode: {} as leaf of defaultrack: {}", node, getDefaultRack());
                 }
             }
+
+            // 如果 defaultRack 没有新的 bookie（bookiesInDefaultRack为空），则排除集合就是原始排除集合
             if ((bookiesInDefaultRack == null) || bookiesInDefaultRack.isEmpty()) {
                 comprehensiveExclusionBookiesSet = excludeBookies;
             } else {
+                // 否则，合并 defaultRack 的所有 bookie 到排除集合
                 comprehensiveExclusionBookiesSet = new HashSet<BookieId>(excludeBookies);
                 comprehensiveExclusionBookiesSet.addAll(bookiesInDefaultRack);
+                // 记录日志，说明多排策略以及排除的具体 bookie 信息
                 LOG.info("enforceMinNumRacksPerWriteQuorum is enabled, so Excluding bookies of defaultRack: {}",
                         bookiesInDefaultRack);
             }
         } else {
+            // 如果没有开启策略，则直接返回原始排除集合
             comprehensiveExclusionBookiesSet = excludeBookies;
         }
+        // 返回排除集合
         return comprehensiveExclusionBookiesSet;
     }
+
 
     @Override
     public PlacementResult<List<BookieId>> newEnsemble(int ensembleSize, int writeQuorumSize,

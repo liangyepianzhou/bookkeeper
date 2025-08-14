@@ -34,7 +34,7 @@ import org.apache.bookkeeper.versioning.Versioned;
 
 @LimitedPrivate
 @Evolving
-public interface RegistrationClient extends AutoCloseable {
+public interface RegistrationClient   extends AutoCloseable {
 
     /**
      * Listener to receive changes from the registration service.

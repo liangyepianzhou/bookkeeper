@@ -1,13 +1,10 @@
 package org.apache.bookkeeper.client;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.Enumeration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.apache.bookkeeper.conf.ClientConfiguration;
 import org.apache.bookkeeper.test.BookKeeperClusterTestCase;
-import org.junit.BeforeClass;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,7 +21,7 @@ public class LedgerAPITest extends BookKeeperClusterTestCase {
     }
 
 
-    @Test
+    @Test(timeout = 600000000)
     public void testCreateLedger() throws Exception {
         ClientConfiguration conf = new ClientConfiguration();
         // 设置zk地址和超时时间

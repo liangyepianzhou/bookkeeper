@@ -58,6 +58,26 @@ import org.apache.bookkeeper.stats.annotations.StatsDoc;
  * When a bookie fails, the other parts of the code turn to this class to find a
  * replacement
  *
+ *  一、整体定位：BookieWatcherImpl 是什么？
+ * BookieWatcherImpl 是 BookKeeper 客户端中用于感知 Bookie 节点状态变化的“观察者”模块。
+ *
+ * ✅ 主要职责：
+ * 监听 ZooKeeper 中的 Bookie 列表变化（读写/只读节点）。
+ * 维护当前可用的 Bookie 集合（writableBookies, readOnlyBookies）。
+ * 为 Ledger 创建和 Bookie 替换提供健康节点列表。
+ * 支持 Bookie “隔离”机制（quarantine）：临时排除有问题的 Bookie。
+ * 与 EnsemblePlacementPolicy 协同工作，实现智能选节点策略。
+ *
+ * | 字段 | 类型 | 说明 |
+ * |------|------|------|
+ * | `conf` | `ClientConfiguration` | 客户端配置 |
+ * | `registrationClient` | `RegistrationClient` | 与 ZooKeeper 交互，获取 Bookie 注册信息 |
+ * | `placementPolicy` | `EnsemblePlacementPolicy` | 节点选择策略（如机架感知） |
+ * | `bookieAddressResolver` | `BookieAddressResolver` | 解析 Bookie ID 到网络地址 |
+ * | `writableBookies` / `readOnlyBookies` | `volatile Set<BookieId>` | 当前可写/只读 Bookie 列表（线程安全） |
+ * | `quarantinedBookies` | `Cache<BookieId, Boolean>` | 被“隔离”的 Bookie 缓存，超时后自动释放 |
+ * | `newEnsembleTimer`, `replaceBookieTimer` | `OpStatsLogger` | 性能统计：创建/替换 Ensemble 的耗时 |
+ * | `ensembleNotAdheringToPlacementPolicy` | `Counter` | 统计违反放置策略的次数 |
  */
 @StatsDoc(
     name = WATCHER_SCOPE,
@@ -188,23 +208,24 @@ class BookieWatcherImpl implements BookieWatcher {
         return !readOnlyBookies.contains(id) && !writableBookies.contains(id);
     }
 
-    // this callback is already not executed in zookeeper thread
+    // 此回调方法已经不在 ZooKeeper 的线程中执行
     private synchronized void processWritableBookiesChanged(Set<BookieId> newBookieAddrs) {
-        // Update watcher outside ZK callback thread, to avoid deadlock in case some other
-        // component is trying to do a blocking ZK operation
+        // 在 ZooKeeper 回调线程之外更新 watcher，以避免死锁。
+        // 因为其他组件可能正在执行阻塞的 ZooKeeper 操作。
         this.writableBookies = newBookieAddrs;
         placementPolicy.onClusterChanged(newBookieAddrs, readOnlyBookies);
-        // we don't need to close clients here, because:
-        // a. the dead bookies will be removed from topology, which will not be used in new ensemble.
-        // b. the read sequence will be reordered based on znode availability, so most of the reads
-        //    will not be sent to them.
-        // c. the close here is just to disconnect the channel, which doesn't remove the channel from
-        //    from pcbc map. we don't really need to disconnect the channel here, since if a bookie is
-        //    really down, PCBC will disconnect itself based on netty callback. if we try to disconnect
-        //    here, it actually introduces side-effects on case d.
-        // d. closing the client here will affect latency if the bookie is alive but just being flaky
-        //    on its znode registration due zookeeper session expire.
-        // e. if we want to permanently remove a bookkeeper client, we should watch on the cookies' list.
+
+        // 这里不需要关闭客户端连接，原因如下：
+        // a. 故障的 Bookie 会被从集群拓扑中移除，因此不会再被用于新的 ensemble。
+        // b. 读取请求的顺序会根据 znode 的可用性重新调整，因此大多数读请求不会发送到这些故障节点。
+        // c. 在这里关闭连接只是断开 Channel，但并不会将其从 pcbc（PerChannelBookieClient）映射中移除。
+        //    我们其实不需要在此处主动断开连接，因为如果 Bookie 确实宕机了，PCBC 会通过 Netty 的回调自动断开。
+        //    如果我们在这里强行断开，反而会引入问题（见 d 点）。
+        // d. 如果 Bookie 实际上是存活的，只是由于 ZooKeeper 会话过期导致其 znode 注册短暂异常（flaky），
+        //    此时关闭连接会影响请求延迟，造成不必要的性能波动。
+        // e. 如果我们希望永久移除一个 BookKeeper 客户端，应该通过监听 "cookies" 列表来实现。
+
+        // 因此，以下代码被注释掉：
         // if (bk.getBookieClient() != null) {
         //     bk.getBookieClient().closeClients(deadBookies);
         // }
