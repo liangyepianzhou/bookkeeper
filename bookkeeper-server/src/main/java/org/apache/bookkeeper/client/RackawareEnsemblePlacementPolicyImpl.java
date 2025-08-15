@@ -444,6 +444,17 @@ public class RackawareEnsemblePlacementPolicyImpl extends TopologyAwareEnsembleP
                 parentPredicate);
     }
 
+    /**
+     * 按拓扑和策略选取书写ensemble（副本组），主要支持跨rack等约束。
+     *
+     * @param ensembleSize 副本组中bookie数量
+     * @param writeQuorumSize 写入quorum大小
+     * @param ackQuorumSize ack quorum大小
+     * @param excludeBookies 本次排除的bookie集合
+     * @param parentEnsemble 父ensemble（可能作为参考，常见于replace场景），可以null
+     * @param parentPredicate 父ensemble筛选条件
+     * @return 选出的ensemble及placement策略合规信息
+     */
     protected PlacementResult<List<BookieId>> newEnsembleInternal(
             int ensembleSize,
             int writeQuorumSize,
@@ -451,10 +462,16 @@ public class RackawareEnsemblePlacementPolicyImpl extends TopologyAwareEnsembleP
             Set<BookieId> excludeBookies,
             Ensemble<BookieNode> parentEnsemble,
             Predicate<BookieNode> parentPredicate) throws BKNotEnoughBookiesException {
-        rwLock.readLock().lock();
+
+        rwLock.readLock().lock(); // 拓扑相关数据访问加读锁，保证一致性
         try {
+            // 1. 将排除bookie集合转为排除节点集合（节点带有地理/网络位置）
             Set<Node> excludeNodes = convertBookiesToNodes(excludeBookies);
+
+            // 2. 本次ensemble需要满足的最少rack数量（受写入quorum和策略约束）
             int minNumRacksPerWriteQuorumForThisEnsemble = Math.min(writeQuorumSize, minNumRacksPerWriteQuorum);
+
+            // 3. 创建拓扑感知的ensemble组装对象（此次可能涉及rack数量判定等）
             RRTopologyAwareCoverageEnsemble ensemble =
                     new RRTopologyAwareCoverageEnsemble(
                             ensembleSize,
@@ -464,32 +481,40 @@ public class RackawareEnsemblePlacementPolicyImpl extends TopologyAwareEnsembleP
                             parentEnsemble,
                             parentPredicate,
                             minNumRacksPerWriteQuorumForThisEnsemble);
-            BookieNode prevNode = null;
+
+            BookieNode prevNode = null; // 用来记录前一个节点（为选"不同rack"策略做准备）
             int numRacks = topology.getNumOfRacks();
-            // only one rack, use the random algorithm.
+
+            // 4. 如果机器只有一个rack
             if (numRacks < 2) {
+                // 但策略要求多个rack，则无法满足
                 if (enforceMinNumRacksPerWriteQuorum && (minNumRacksPerWriteQuorumForThisEnsemble > 1)) {
                     LOG.error("Only one rack available and minNumRacksPerWriteQuorum is enforced, so giving up");
                     throw new BKNotEnoughBookiesException();
                 }
-                List<BookieNode> bns = selectRandom(ensembleSize, excludeNodes, TruePredicate.INSTANCE,
-                        ensemble);
-                ArrayList<BookieId> addrs = new ArrayList<BookieId>(ensembleSize);
+                // 只随机选ensemble，不做rack区分
+                List<BookieNode> bns = selectRandom(ensembleSize, excludeNodes, TruePredicate.INSTANCE, ensemble);
+                ArrayList<BookieId> addrs = new ArrayList<>(ensembleSize);
                 for (BookieNode bn : bns) {
                     addrs.add(bn.getAddr());
                 }
+                // 返回并说明未满足placement规则
                 return PlacementResult.of(addrs, PlacementPolicyAdherence.FAIL);
             }
-            //Choose different rack nodes.
-            String curRack = null;
+
+            // 5. 多rack场景，优先让节点落在不同rack
+            String curRack = null; // 当前选中的rack
             for (int i = 0; i < ensembleSize; i++) {
+                // 第一个节点
                 if (null == prevNode) {
+                    // 如果没有本地节点或本地节点在default rack，则从root开始
                     if ((null == localNode) || defaultRack.equals(localNode.getNetworkLocation())) {
                         curRack = NodeBase.ROOT;
                     } else {
                         curRack = localNode.getNetworkLocation();
                     }
                 } else {
+                    // 每次选不同rack
                     if (!curRack.startsWith("~")) {
                         curRack = "~" + prevNode.getNetworkLocation();
                     } else {
@@ -498,8 +523,10 @@ public class RackawareEnsemblePlacementPolicyImpl extends TopologyAwareEnsembleP
                 }
                 boolean firstBookieInTheEnsemble = (null == prevNode);
                 try {
+                    // 从当前rack（或组）随机选1个节点
                     prevNode = selectRandomFromRack(curRack, excludeNodes, ensemble, ensemble);
                 } catch (BKNotEnoughBookiesException e) {
+                    // rack选不出来，回退到ROOT（全网选），如仍失败则抛异常
                     if (!curRack.equals(NodeBase.ROOT)) {
                         curRack = NodeBase.ROOT;
                         prevNode = selectFromNetworkLocation(curRack, excludeNodes, ensemble, ensemble,
@@ -509,19 +536,22 @@ public class RackawareEnsemblePlacementPolicyImpl extends TopologyAwareEnsembleP
                     }
                 }
             }
+
+            // 6. 最终结果，如果副本组没选满则报错
             List<BookieId> bookieList = ensemble.toList();
             if (ensembleSize != bookieList.size()) {
                 LOG.error("Not enough {} bookies are available to form an ensemble : {}.",
-                          ensembleSize, bookieList);
+                        ensembleSize, bookieList);
                 throw new BKNotEnoughBookiesException();
             }
+            // 返回ensemble及placement策略符合性
             return PlacementResult.of(bookieList,
-                                      isEnsembleAdheringToPlacementPolicy(
-                                              bookieList, writeQuorumSize, ackQuorumSize));
+                    isEnsembleAdheringToPlacementPolicy(bookieList, writeQuorumSize, ackQuorumSize));
         } finally {
             rwLock.readLock().unlock();
         }
     }
+
 
     @Override
     public PlacementResult<BookieId> replaceBookie(int ensembleSize, int writeQuorumSize, int ackQuorumSize,
@@ -795,85 +825,111 @@ public class RackawareEnsemblePlacementPolicyImpl extends TopologyAwareEnsembleP
         return selectRandomInternal(null,  numBookies, excludeBookies, predicate, ensemble);
     }
 
-    protected List<BookieNode> selectRandomInternal(List<BookieNode> bookiesToSelectFrom,
-                                                    int numBookies,
-                                                    Set<Node> excludeBookies,
-                                                    Predicate<BookieNode> predicate,
-                                                    Ensemble<BookieNode> ensemble)
-        throws BKNotEnoughBookiesException {
-        WeightedRandomSelection<BookieNode> wRSelection = null;
+    /**
+     * 从可选候选列表（bookiesToSelectFrom）中选出numBookies个BookieNode节点，新选节点不能在excludeBookies中，
+     * 并满足predicate和ensemble的要求，返回选出的节点列表。
+     * 如果找不到足够的节点则抛出异常BKNotEnoughBookiesException。
+     */
+    protected List<BookieNode> selectRandomInternal(
+            List<BookieNode> bookiesToSelectFrom,   // 候选Bookie节点列表，可为null
+            int numBookies,                         // 需要选择的Bookie节点数量
+            Set<Node> excludeBookies,               // 需要排除的节点集合
+            Predicate<BookieNode> predicate,        // 用于额外限制判断节点是否可被选入的断言函数
+            Ensemble<BookieNode> ensemble           // 当前ensemble，能为它添加节点
+    ) throws BKNotEnoughBookiesException {
+
+        WeightedRandomSelection<BookieNode> wRSelection = null; // 权重随机选择器
+
+        // 若输入的候选节点列表为空，则用所有已知节点
         if (bookiesToSelectFrom == null) {
-            // If the list is null, we need to select from the entire knownBookies set
+            // 用所有已知的Bookie节点作为备选
             wRSelection = this.weightedSelection;
             bookiesToSelectFrom = new ArrayList<BookieNode>(knownBookies.values());
         }
+
+        // 如果是加权模式，则构建加权随机选择器数据结构
         if (isWeighted) {
+            // 若排除节点后不足numBookies个可选节点，则抛异常
             if (CollectionUtils.subtract(bookiesToSelectFrom, excludeBookies).size() < numBookies) {
                 throw new BKNotEnoughBookiesException();
             }
+
+            // 如果没有传入加权选择器，则新建一个
             if (wRSelection == null) {
                 wRSelection = new WeightedRandomSelectionImpl<BookieNode>(this.maxWeightMultiple);
             }
 
-            Map<BookieNode, WeightedObject> rackMap = new HashMap<BookieNode, WeightedObject>();
+            // 构建加权对象映射
+            Map<BookieNode, WeightedObject> rackMap = new HashMap<>();
             for (BookieNode n : bookiesToSelectFrom) {
                 if (this.bookieInfoMap.containsKey(n)) {
-                    rackMap.put(n, this.bookieInfoMap.get(n));
+                    rackMap.put(n, this.bookieInfoMap.get(n)); // 用已有权重
                 } else {
-                    rackMap.put(n, new BookieInfo());
+                    rackMap.put(n, new BookieInfo()); // 默认权重
                 }
             }
+            // 更新加权选择器的可选节点
             wRSelection.updateMap(rackMap);
         } else {
+            // 非权重模式直接打乱候选节点列表
             Collections.shuffle(bookiesToSelectFrom);
         }
 
         BookieNode bookie;
-        List<BookieNode> newBookies = new ArrayList<BookieNode>(numBookies);
-        Iterator<BookieNode> it = bookiesToSelectFrom.iterator();
-        Set<BookieNode> bookiesSeenSoFar = new HashSet<BookieNode>();
+        List<BookieNode> newBookies = new ArrayList<>(numBookies); // 结果列表
+        Iterator<BookieNode> it = bookiesToSelectFrom.iterator();   // 普通随机模式下使用
+        Set<BookieNode> bookiesSeenSoFar = new HashSet<>();         // 防止加权模式死循环
+
+        // 开始挑选
         while (numBookies > 0) {
+            // 加权模式
             if (isWeighted) {
+                // 如果所有节点都遍历过却还没满足需求，则跳出循环 ― 防止死循环
                 if (bookiesSeenSoFar.size() == bookiesToSelectFrom.size()) {
-                    // If we have gone through the whole available list of bookies,
-                    // and yet haven't been able to satisfy the ensemble request, bail out.
-                    // We don't want to loop infinitely.
                     break;
                 }
-                bookie = wRSelection.getNextRandom();
-                bookiesSeenSoFar.add(bookie);
+                bookie = wRSelection.getNextRandom(); // 随机按权重选一个节点
+                bookiesSeenSoFar.add(bookie);         // 标记已经选过
             } else {
+                // 非权重模式：遍历打乱后的节点列表
                 if (it.hasNext()) {
                     bookie = it.next();
                 } else {
                     break;
                 }
             }
+
+            // 跳过被排除的节点
             if (excludeBookies.contains(bookie)) {
                 continue;
             }
 
-            // When durability is being enforced; we must not violate the
-            // predicate even when selecting a random bookie; as durability
-            // guarantee is not best effort; correctness is implied by it
+            // 若强制耐久性，且该节点不满足断言，则跳过
             if (enforceDurability && !predicate.apply(bookie, ensemble)) {
                 continue;
             }
 
+            // 若能成功加入ensemble（该节点未被ensemble包含），则加入结果集
             if (ensemble.addNode(bookie)) {
+                // 为避免重复，再次加入排除集
                 excludeBookies.add(bookie);
                 newBookies.add(bookie);
-                --numBookies;
+                --numBookies; // 还需挑选的节点数-1
             }
         }
+        // 挑选满足条件数量，则返回
         if (numBookies == 0) {
             return newBookies;
         }
-        LOG.warn("Failed to find {} bookies : excludeBookies {}, allBookies {}.",
-            numBookies, excludeBookies, bookiesToSelectFrom);
 
+        // 没法选满，记录warning日志
+        LOG.warn("Failed to find {} bookies : excludeBookies {}, allBookies {}.",
+                numBookies, excludeBookies, bookiesToSelectFrom);
+
+        // 抛出异常，指出可用节点不足
         throw new BKNotEnoughBookiesException();
     }
+
 
     @Override
     public void registerSlowBookie(BookieId bookieSocketAddress, long entryId) {

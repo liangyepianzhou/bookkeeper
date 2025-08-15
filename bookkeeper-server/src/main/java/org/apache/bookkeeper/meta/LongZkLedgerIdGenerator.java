@@ -292,41 +292,48 @@ public class LongZkLedgerIdGenerator implements LedgerIdGenerator {
         }
     }
 
+    /**
+     * 为Ledger生成唯一ID，并通过回调返回结果。
+     * 支持从31位ID方式切换至63位ID方式的自动判断和迁移。
+     *
+     * @param cb 回调接口，返回生成的ledgerId或错误码。
+     */
     @Override
     public void generateLedgerId(final GenericCallback<Long> cb) {
         try {
-            if (!ledgerIdGenPathPresent(zk)) {
-                // We've not moved onto 63-bit ledgers yet.
-                shortIdGen.generateLedgerId(new GenericCallback<Long>(){
-                        @Override
-                        public void operationComplete(int rc, Long result) {
-                            if (rc == BKException.Code.LedgerIdOverflowException) {
-                                // 31-bit IDs overflowed. Start using 63-bit ids.
-                                createLongLedgerIdPathAndGenerateLongLedgerId(cb, ledgerIdGenPath);
-                            } else {
-                                // 31-bit Generation worked OK, or had some other
-                                // error that we will pass on.
-                                cb.operationComplete(rc, result);
-                            }
+            // 判断是否已启用63位ledgerId生成路径
+            if (!ledgerIdGenPathPresent(zk)) { // 还没启用63位ID
+                // 使用短ID（31位）生成器生成LedgerId
+                shortIdGen.generateLedgerId(new GenericCallback<Long>() {
+                    @Override
+                    public void operationComplete(int rc, Long result) {
+                        // 如果短ID已用完（溢出），切换到63位ID生成方式
+                        if (rc == BKException.Code.LedgerIdOverflowException) {
+                            // 31位ID已经耗尽，开始使用长ID（63位）
+                            createLongLedgerIdPathAndGenerateLongLedgerId(cb, ledgerIdGenPath);
+                        } else {
+                            // 31位生成成功或遇到其它错误，则原样转发回调
+                            cb.operationComplete(rc, result);
                         }
-                    });
+                    }
+                });
             } else {
-                // We've already started generating 63-bit ledger IDs.
-                // Keep doing that.
+                // 已经开始用63位长ID，直接用长ID生成器生成LedgerId
                 generateLongLedgerId(cb);
             }
-        } catch (KeeperException e) {
+        } catch (KeeperException e) { // ZooKeeper操作异常
             LOG.error("Failed to create long ledger ID path", e);
             cb.operationComplete(BKException.Code.ZKException, null);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        } catch (InterruptedException e) { // 线程中断异常
+            Thread.currentThread().interrupt(); // 恢复线程中断状态
             LOG.error("Failed to create long ledger ID path", e);
             cb.operationComplete(BKException.Code.InterruptedException, null);
-        } catch (IOException e) {
+        } catch (IOException e) { // IO异常
             LOG.error("Failed to create long ledger ID path", e);
             cb.operationComplete(BKException.Code.IllegalOpException, null);
         }
     }
+
 
     @Override
     public void close() throws IOException {
