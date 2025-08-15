@@ -1247,7 +1247,7 @@ public class LedgerHandle implements WriteHandle {
 
         SyncAddCallback callback = new SyncAddCallback();
         asyncAddEntry(data, offset, length, callback, null);
-
+        // 这里不可能发回null，除非超时292年😂
         return SyncCallbackUtils.waitForResult(callback);
     }
 
@@ -1583,36 +1583,47 @@ public class LedgerHandle implements WriteHandle {
         return writableResult;
     }
 
+    /**
+     * 异步添加条目的核心方法。
+     * 主要处理限流、Ledger关闭检查、写入分布式副本集可达性检测，并最终发起写操作。
+     */
     protected void doAsyncAddEntry(final PendingAddOp op) {
+        // 1. 限流处理：如有throttler，则阻塞直到令牌可拿到，防止过载
         if (throttler != null) {
             throttler.acquire();
         }
 
-        boolean wasClosed = false;
-        synchronized (this) {
-            // synchronized on this to ensure that
-            // the ledger isn't closed between checking and
-            // updating lastAddPushed
-            if (isHandleWritable()) {
-                long entryId = ++lastAddPushed;
-                long currentLedgerLength = addToLength(op.payload.readableBytes());
-                op.setEntryId(entryId);
-                op.setLedgerLength(currentLedgerLength);
-                pendingAddOps.add(op);
+        boolean wasClosed = false; // 标记Ledger是否已关闭
+        synchronized (this) { // 加锁，保证检查和更新状态的原子性
+            // 保证Ledger在未关闭状态下才能正确push entry
+            if (isHandleWritable()) { // 检查Ledger句柄是否可写
+                long entryId = ++lastAddPushed; // 递增最后提交条目的ID
+                long currentLedgerLength = addToLength(op.payload.readableBytes()); // 更新Ledger长度
+                op.setEntryId(entryId); // 设置本次操作条目ID
+                op.setLedgerLength(currentLedgerLength); // 设置Ledger当前长度
+                pendingAddOps.add(op); // 把操作加入待写队列
             } else {
-                wasClosed = true;
+                wasClosed = true; // 如果Ledger不能写，标记为关闭
             }
         }
 
+        // 2. Ledger已关闭，回调失败
         if (wasClosed) {
-            // make sure the callback is triggered in main worker pool
+            // 在主工作线程池中触发用户回调，通知写入失败（Ledger已关闭）
             try {
                 executeOrdered(new Runnable() {
                     @Override
                     public void run() {
                         LOG.warn("Attempt to add to closed ledger: {}", ledgerId);
-                        op.cb.addCompleteWithLatency(BKException.Code.LedgerClosedException,
-                                LedgerHandle.this, INVALID_ENTRY_ID, 0, op.ctx);
+                        // 通知回调失败，并传递异常码
+                        op.cb.addCompleteWithLatency(
+                                BKException.Code.LedgerClosedException,
+                                LedgerHandle.this,
+                                INVALID_ENTRY_ID,
+                                0, // 延迟为0
+                                op.ctx
+                        );
+                        // 回收PendingAddOp对象，资源复用
                         op.recyclePendAddOpObject();
                     }
 
@@ -1622,28 +1633,37 @@ public class LedgerHandle implements WriteHandle {
                     }
                 });
             } catch (RejectedExecutionException e) {
-                op.cb.addCompleteWithLatency(BookKeeper.getReturnRc(clientCtx.getBookieClient(),
-                                BKException.Code.InterruptedException),
-                        LedgerHandle.this, INVALID_ENTRY_ID, 0, op.ctx);
+                // 调度被拒绝，说明主工作池不可用，直接回调失败
+                op.cb.addCompleteWithLatency(
+                        BookKeeper.getReturnRc(clientCtx.getBookieClient(), BKException.Code.InterruptedException),
+                        LedgerHandle.this,
+                        INVALID_ENTRY_ID,
+                        0,
+                        op.ctx
+                );
                 op.recyclePendAddOpObject();
             }
-            return;
+            return; // 直接返回，不再继续后续流程
         }
 
+        // 3. 检查写副本集的可用性（如果配置了等待可用timeout），允许快速失败
         if (clientCtx.getConf().waitForWriteSetMs >= 0) {
             DistributionSchedule.WriteSet ws = distributionSchedule.getWriteSet(op.getEntryId());
             try {
+                // 如果在指定时间内副本集不可写，则开启快速失败
                 if (!waitForWritable(ws, 0, clientCtx.getConf().waitForWriteSetMs)) {
                     op.allowFailFastOnUnwritableChannel();
                 }
             } finally {
+                // 回收WriteSet对象，节省资源
                 ws.recycle();
             }
         }
 
+        // 4. 启动写入操作
         op.initiate();
-
     }
+
 
     synchronized void updateLastConfirmed(long lac, long len) {
         if (lac > lastAddConfirmed) {
@@ -2135,25 +2155,37 @@ public class LedgerHandle implements WriteHandle {
     }
 
     void maybeHandleDelayedWriteBookieFailure() {
+        // 定义一个用于替换的 Map
         Map<Integer, BookieId> toReplace = null;
+
+        // 用元数据锁保护并发访问
         synchronized (metadataLock) {
+            // 如果没有延迟写入失败的 Bookie，直接返回
             if (delayedWriteFailedBookies.isEmpty()) {
                 return;
             }
+            // 复制当前延迟失败的 Bookie，准备进行处理
             toReplace = new HashMap<>(delayedWriteFailedBookies);
+            // 清空延迟写失败节点集合
             delayedWriteFailedBookies.clear();
         }
 
+        // 如果没有需要处理的节点，直接返回
         if (toReplace.isEmpty()) {
             return;
         }
 
-        // Original intent of this change is to do a best-effort ensemble change.
-        // But this is not possible until the local metadata is completely immutable.
-        // Until the feature "Make LedgerMetadata Immutable #610" Is complete we will use
-        // handleBookieFailure() to handle delayed writes as regular bookie failures.
+        // 本来的目的是尽量做 ensemble（Bookie 集群）更换，
+        // 但由于 LedgerMetadata 目前是可变的，不完全支持这种操作。
+        // 在特性 "Make L元数据是什么edgerMetadata Immutable #610" 完成之前，
+        // 还是用 handleBookieFailure() 方法来处理延迟写失败，
+        // 把延迟写失败当作正常的 Bookie 故障来处理。
+        // 注意：不可变指的是“对象实例不可变”，不是说“元数据永远不变”。元数据仍然会随时间演进，但每次演进是“创建新对象 + 原子替换引用”，而不是“就地改旧对象”。
+        // Treat delayed-write failures as regular bookie failures and trigger an ensemble change.
+        // LedgerMetadata is immutable now (#610), so this is handled via MetadataUpdateLoop.
         handleBookieFailure(toReplace);
     }
+
 
     void handleBookieFailure(final Map<Integer, BookieId> failedBookies) {
         if (clientCtx.getConf().disableEnsembleChangeFeature.isAvailable()) {
@@ -2166,6 +2198,8 @@ public class LedgerHandle implements WriteHandle {
             return;
         }
 
+        // 针对延迟写失败，这里的操作是对的吗？
+        // DEFERRED_SYNC 放宽了 ack=durable 的前提，因此在失败场景下无法安全地通过换副本维持持久性；最佳选择是 fail-fast，防止继续在不安全前提下推进。
         if (writeFlags.contains(WriteFlag.DEFERRED_SYNC)) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Cannot perform ensemble change with write flags {}. "

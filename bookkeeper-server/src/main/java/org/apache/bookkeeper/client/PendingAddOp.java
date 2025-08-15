@@ -226,165 +226,179 @@ class PendingAddOp implements WriteCallback {
     }
 
     /**
-     * Initiate the add operation.
+     * 发起（异步）添加条目操作。
+     * 该方法在PendingAddOp准备好后被调用，负责构造数据包，
+     * 检查Ledger状态，可能处理分布式写目标变化，并对每个副本Bookie推送写请求。
      */
     public synchronized void initiate() {
-        hasRun = true;
+        hasRun = true; // 标记这个操作已触发，防止重复执行
+
         if (callbackTriggered) {
-            // this should only be true if the request was failed due
-            // to another request ahead in the pending queue,
-            // so we can just ignore this request
-            maybeRecycle();
+            // 如果回调已经被触发，说明这个请求因前序失败或者被取消，则无需再执行
+            // 一般是由于pending队列里前面的操作失败，导致本操作也提前失败了
+            maybeRecycle(); // 对象复用，释放资源
             return;
         }
 
-        this.requestTimeNanos = MathUtils.nowInNano();
-        checkNotNull(lh);
-        checkNotNull(lh.macManager);
+        this.requestTimeNanos = MathUtils.nowInNano(); // 记录本次写入请求触发的时间戳
 
+        checkNotNull(lh); // ledger句柄非空校验，防止空指针异常
+        checkNotNull(lh.macManager); // 消息鉴权管理器非空校验
+
+        // 决定写入标志位（是否为恢复性写，以及是否设置高优先级）
         int flags = isRecoveryAdd ? FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY : FLAG_NONE;
-        this.toSend = lh.macManager.computeDigestAndPackageForSending(
-                entryId, lh.lastAddConfirmed, currentLedgerLength,
-                payload, lh.ledgerKey, flags);
-        // ownership of RefCounted ByteBuf was passed to computeDigestAndPackageForSending
-        payload = null;
 
-        // We are about to send. Check if we need to make an ensemble change
-        // because of delayed write errors
+        // 用于计算消息摘要（MAC），同时将要写入的数据（payload）封装成待发送的数据包（toSend）
+        // 注意：computeDigestAndPackageForSending会接管payload的引用计数管理（ByteBuf），所以payload置为null防止重复释放
+        this.toSend = lh.macManager.computeDigestAndPackageForSending(
+                entryId,
+                lh.lastAddConfirmed,
+                currentLedgerLength,
+                payload,
+                lh.ledgerKey,
+                flags
+        );
+        payload = null; // 标志payload资源交由macManager管理
+
+        // 处理“延迟写错误”场景，Bookie集群可能有坏节点，需要重排target ensemble
         lh.maybeHandleDelayedWriteBookieFailure();
 
-        // Iterate over set and trigger the sendWriteRequests
+        // 遍历分布式写副本集（quorum）并发起真正的写请求
         for (int i = 0; i < lh.distributionSchedule.getWriteQuorumSize(); i++) {
-            sendWriteRequest(ensemble, lh.distributionSchedule.getWriteSetBookieIndex(entryId, i));
+            // 每个Bookie的下标按分布策略取出，然后依次发送写请求
+            sendWriteRequest(
+                    ensemble, // 当前写副本集
+                    lh.distributionSchedule.getWriteSetBookieIndex(entryId, i) // 副本集内bookie的下标
+            );
         }
     }
 
+
     @Override
     public synchronized void writeComplete(int rc, long ledgerId, long entryId, BookieId addr, Object ctx) {
-        int bookieIndex = (Integer) ctx;
-        --pendingWriteRequests;
+        int bookieIndex = (Integer) ctx; // 获得当前写入请求对应的bookie索引
+        --pendingWriteRequests; // 当前待写请求数减一
 
+        // 如果ensemble（副本列表）已经改变，则该节点失败无关紧要
         if (!ensemble.get(bookieIndex).equals(addr)) {
-            // ensemble has already changed, failure of this addr is immaterial
+            // 副本组已经变化，此节点失败无关紧要
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Write did not succeed: " + ledgerId + ", " + entryId + ". But we have already fixed it.");
+                LOG.debug("写入失败: " + ledgerId + ", " + entryId + ". 但已自动修复。");
             }
             return;
         }
 
-        // must record all acks, even if complete (completion can be undone by an ensemble change)
+        // 必须记录所有ack，即使已完成（因为副本组变化可能撤销完成状态）
         boolean ackQuorum = false;
-        if (BKException.Code.OK == rc) {
-            ackQuorum = ackSet.completeBookieAndCheck(bookieIndex);
-            addEntrySuccessBookies.add(ensemble.get(bookieIndex));
+        if (BKException.Code.OK == rc) { // 如果返回码OK，说明本次写入成功
+            ackQuorum = ackSet.completeBookieAndCheck(bookieIndex); // 标记bookie响应，并检查是否已满足Quorum
+            addEntrySuccessBookies.add(ensemble.get(bookieIndex)); // 记录成功响应的bookie
         }
 
-        if (completed) {
+        if (completed) { // 如果操作已完成，但收到异常应答
             if (rc != BKException.Code.OK) {
-                // Got an error after satisfying AQ. This means we are under replicated at the create itself.
-                // Update the stat to reflect it.
+                // AQ已满足后收到错误，说明创建时已处于欠副本状态，统计计数
                 clientCtx.getClientStats().getAddOpUrCounter().inc();
+                // 如果没有禁用ensemble切换，并且不是延迟切换副本组，则通知处理写失败
                 if (!clientCtx.getConf().disableEnsembleChangeFeature.isAvailable()
                         && !clientCtx.getConf().delayEnsembleChange) {
                     lh.notifyWriteFailed(bookieIndex, addr);
                 }
             }
-            // even the add operation is completed, but because we don't reset completed flag back to false when
-            // #unsetSuccessAndSendWriteRequest doesn't break ack quorum constraint. we still have current pending
-            // add op is completed but never callback. so do a check here to complete again.
+            // 虽然add操作已完成，但由于某些处理未重置completed标志，导致没有回调成功，需要补充回调
             //
-            // E.g. entry x is going to complete.
+            // 场景举例：
+            // 1）x+k条写入失败，handleBookieFailure增加blockAddCompletions阻止完成
+            // 2）x写入收到所有应答，设置completed=true，但未回调成功，因为blockAddCompletions阻止
+            // 3）副本组切换完成，lh unset success从x到x+k，但操作未违反ackSet约束，completed仍为true
+            // 4）新bookie再次重试写入完成，发现pending op已完成，故需要再次回调
             //
-            // 1) entry x + k hits a failure. lh.handleBookieFailure increases blockAddCompletions to 1, for ensemble
-            //    change
-            // 2) entry x receives all responses, sets completed to true but fails to send success callback because
-            //    blockAddCompletions is 1
-            // 3) ensemble change completed. lh unset success starting from x to x+k, but since the unset doesn't break
-            //    ackSet constraint. #removeBookieAndCheck doesn't set completed back to false.
-            // 4) so when the retry request on new bookie completes, it finds the pending op is already completed.
-            //    we have to trigger #sendAddSuccessCallbacks
-            //
-            sendAddSuccessCallbacks();
-            // I am already finished, ignore incoming responses.
-            // otherwise, we might hit the following error handling logic, which might cause bad things.
+            sendAddSuccessCallbacks(); // 执行成功回调
+            // 我已经完成，忽略后续应答，否则可能出错
             maybeRecycle();
             return;
         }
 
+        // 针对不同的返回码做异常判断和处理
         switch (rc) {
-        case BKException.Code.OK:
-            // continue
-            break;
-        case BKException.Code.ClientClosedException:
-            // bookie client is closed.
-            lh.errorOutPendingAdds(rc);
-            return;
-        case BKException.Code.IllegalOpException:
-            // illegal operation requested, like using unsupported feature in v2 protocol
-            lh.handleUnrecoverableErrorDuringAdd(rc);
-            return;
-        case BKException.Code.LedgerFencedException:
-            LOG.warn("Fencing exception on write: L{} E{} on {}",
-                    ledgerId, entryId, addr);
-            lh.handleUnrecoverableErrorDuringAdd(rc);
-            return;
-        case BKException.Code.UnauthorizedAccessException:
-            LOG.warn("Unauthorized access exception on write: L{} E{} on {}",
-                    ledgerId, entryId, addr);
-            lh.handleUnrecoverableErrorDuringAdd(rc);
-            return;
-        default:
-            if (clientCtx.getConf().delayEnsembleChange) {
-                if (ackSet.failBookieAndCheck(bookieIndex, addr)
-                        || rc == BKException.Code.WriteOnReadOnlyBookieException) {
-                    Map<Integer, BookieId> failedBookies = ackSet.getFailedBookies();
-                    LOG.warn("Failed to write entry ({}, {}) to bookies {}, handling failures.",
-                            ledgerId, entryId, failedBookies);
-                    // we can't meet ack quorum requirement, trigger ensemble change.
-                    lh.handleBookieFailure(failedBookies);
-                } else if (LOG.isDebugEnabled()) {
-                    LOG.debug("Failed to write entry ({}, {}) to bookie ({}, {}),"
-                                    + " but it didn't break ack quorum, delaying ensemble change : {}",
+            case BKException.Code.OK:
+                // 写入成功，继续
+                break;
+            case BKException.Code.ClientClosedException:
+                // 客户端已关闭，所有pending写操作都失败
+                lh.errorOutPendingAdds(rc);
+                return;
+            case BKException.Code.IllegalOpException:
+                // 非法操作，比如协议不支持的特性
+                lh.handleUnrecoverableErrorDuringAdd(rc);
+                return;
+            case BKException.Code.LedgerFencedException:
+                // ledger被Fenced（锁定），不可写
+                LOG.warn("写入Fenced异常: L{} E{} 于 {}",
+                        ledgerId, entryId, addr);
+                lh.handleUnrecoverableErrorDuringAdd(rc);
+                return;
+            case BKException.Code.UnauthorizedAccessException:
+                // 没有写入权限
+                LOG.warn("写入权限异常: L{} E{} 于 {}",
+                        ledgerId, entryId, addr);
+                lh.handleUnrecoverableErrorDuringAdd(rc);
+                return;
+            default:
+                // 其它异常处理，是否延迟切换副本组
+                if (clientCtx.getConf().delayEnsembleChange) {
+                    if (ackSet.failBookieAndCheck(bookieIndex, addr)
+                            || rc == BKException.Code.WriteOnReadOnlyBookieException) {
+                        // bookie挂了或变只读，获取所有已失败bookie索引与地址
+                        Map<Integer, BookieId> failedBookies = ackSet.getFailedBookies();
+                        LOG.warn("写入({},{})失败到bookies {}, 处理异常。",
+                                ledgerId, entryId, failedBookies);
+                        // 无法满足Quorum，触发ensemble切换
+                        lh.handleBookieFailure(failedBookies);
+                    } else if (LOG.isDebugEnabled()) {
+                        // 未破坏Quorum，延迟副本组切换
+                        LOG.debug("写入({},{})失败于bookie({},{})，未破坏Quorum，延迟切换: {}",
+                                ledgerId, entryId, bookieIndex, addr, BKException.getMessage(rc));
+                    }
+                } else {
+                    LOG.warn("写入({},{})失败于bookie({},{})：{}",
                             ledgerId, entryId, bookieIndex, addr, BKException.getMessage(rc));
+                    lh.handleBookieFailure(ImmutableMap.of(bookieIndex, addr)); // 非延迟，直接处理副本组切换
                 }
-            } else {
-                LOG.warn("Failed to write entry ({}, {}) to bookie ({}, {}): {}",
-                        ledgerId, entryId, bookieIndex, addr, BKException.getMessage(rc));
-                lh.handleBookieFailure(ImmutableMap.of(bookieIndex, addr));
-            }
-            return;
+                return;
         }
 
+        // 满足ackQuorum且尚未完成时，做所有约束检查
         if (ackQuorum && !completed) {
+            // 检查写入应答的bookie是否分布在足够多的Fault Domain中
             if (clientCtx.getConf().enforceMinNumFaultDomainsForWrite
-                && !(clientCtx.getPlacementPolicy()
-                              .areAckedBookiesAdheringToPlacementPolicy(addEntrySuccessBookies,
-                                                                        lh.getLedgerMetadata().getWriteQuorumSize(),
-                                                                        lh.getLedgerMetadata().getAckQuorumSize()))) {
-                LOG.warn("Write success for entry ID {} delayed, not acknowledged by bookies in enough fault domains",
-                         entryId);
-                // Increment to indicate write did not complete due to not enough fault domains
+                    && !(clientCtx.getPlacementPolicy()
+                    .areAckedBookiesAdheringToPlacementPolicy(addEntrySuccessBookies,
+                            lh.getLedgerMetadata().getWriteQuorumSize(),
+                            lh.getLedgerMetadata().getAckQuorumSize()))) {
+                LOG.warn("entry ID {} 写入成功被延迟，因为Fault Domain数不足", entryId);
+                // 统计因为故障域不足造成的延迟
                 clientCtx.getClientStats().getWriteDelayedDueToNotEnoughFaultDomains().inc();
 
-                // Only do this for the first time.
+                // 仅第一次写入延迟时记录开始时间
                 if (writeDelayedStartTime == -1) {
                     writeDelayedStartTime = MathUtils.nowInNano();
                 }
             } else {
-                completed = true;
-                this.qwcLatency = MathUtils.elapsedNanos(requestTimeNanos);
+                completed = true; // 操作完成
+                this.qwcLatency = MathUtils.elapsedNanos(requestTimeNanos); // 记录延迟
 
                 if (writeDelayedStartTime != -1) {
                     clientCtx.getClientStats()
-                             .getWriteDelayedDueToNotEnoughFaultDomainsLatency()
-                             .registerSuccessfulEvent(MathUtils.elapsedNanos(writeDelayedStartTime),
-                                                      TimeUnit.NANOSECONDS);
+                            .getWriteDelayedDueToNotEnoughFaultDomainsLatency()
+                            .registerSuccessfulEvent(MathUtils.elapsedNanos(writeDelayedStartTime),
+                                    TimeUnit.NANOSECONDS);
                 }
-
-                sendAddSuccessCallbacks();
+                sendAddSuccessCallbacks(); // 执行成功回调
             }
         }
     }
+
 
     void sendAddSuccessCallbacks() {
         lh.sendAddSuccessCallbacks();
