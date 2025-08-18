@@ -939,24 +939,24 @@ public class Journal implements CheckpointSource {
     }
 
     /**
-     * A thread used for persisting journal entries to journal files.
+     * Journal线程：用于将日志条目持久化到journal文件
      *
      * <p>
-     * Besides persisting journal entries, it also takes responsibility of
-     * rolling journal files when a journal file reaches journal file size
-     * limitation.
+     * 不仅负责journal条目的持久化，也负责在journal文件达到大小上限时进行文件滚动（rollover）。
      * </p>
+     *
      * <p>
-     * During journal rolling, it first closes the writing journal, generates
-     * new journal file using current timestamp, and continue persistence logic.
-     * Those journals will be garbage collected in SyncThread.
+     * 滚动journal文件时，先关闭当前写入journal，生成一个新的journal文件（时间戳命名），继续后续持久化流程。
+     * 已完成的journal文件会被SyncThread线程（后台元数据同步线程）回收。
      * </p>
+     *
      * @see org.apache.bookkeeper.bookie.SyncThread
      */
     public void run() {
         LOG.info("Starting journal on {}", journalDirectory);
-        ThreadRegistry.register(journalThreadName);
+        ThreadRegistry.register(journalThreadName); // 注册线程到线程管理器，便于故障排查和线程跟踪
 
+        // 是否开启CPU绑定等待（优化线程上下文切换性能，典型用于低延迟场景如SSD）
         if (conf.isBusyWaitEnabled()) {
             try {
                 CpuAffinity.acquireCore();
@@ -965,134 +965,133 @@ public class Journal implements CheckpointSource {
             }
         }
 
-        RecyclableArrayList<QueueEntry> toFlush = entryListRecycler.newInstance();
-        int numEntriesToFlush = 0;
-        ByteBuf lenBuff = Unpooled.buffer(4);
+        // 初始化各类缓冲对象
+        RecyclableArrayList<QueueEntry> toFlush = entryListRecycler.newInstance(); // flush队列，用于短暂收集待刷盘请求
+        int numEntriesToFlush = 0;        // 当前待刷盘队列条目数
+        ByteBuf lenBuff = Unpooled.buffer(4); // 日志条目长度缓冲区
         ByteBuf paddingBuff = Unpooled.buffer(2 * conf.getJournalAlignmentSize());
         paddingBuff.writeZero(paddingBuff.capacity());
 
-        BufferedChannel bc = null;
-        JournalChannel logFile = null;
-        forceWriteThread.start();
-        Stopwatch journalCreationWatcher = Stopwatch.createUnstarted();
-        Stopwatch journalFlushWatcher = Stopwatch.createUnstarted();
-        long batchSize = 0;
+        BufferedChannel bc = null; // 日志写入底层缓存通道
+        JournalChannel logFile = null; // 当前journal文件句柄
+        forceWriteThread.start(); // 启动专用强制刷盘线程
+        Stopwatch journalCreationWatcher = Stopwatch.createUnstarted(); // 用于统计journal文件创建时长
+        Stopwatch journalFlushWatcher = Stopwatch.createUnstarted(); // 用于统计flush时长
+        long batchSize = 0; // 当前批次写入字节总量
+
         try {
+            // 启动时，获取所有已有的journal文件ID列表
             List<Long> journalIds = listJournalIds(journalDirectory, null);
-            // Should not use MathUtils.now(), which use System.nanoTime() and
-            // could only be used to measure elapsed time.
-            // http://docs.oracle.com/javase/1.5.0/docs/api/java/lang/System.html#nanoTime%28%29
+            // 日志文件ID初始化：如无旧文件，则用当前时间戳，否则用最后一个journal文件ID
+            // 注意不要用nanoTime(), 只适合测量耗时不适合生成全局唯一ID
             long logId = journalIds.isEmpty() ? System.currentTimeMillis() : journalIds.get(journalIds.size() - 1);
-            long lastFlushPosition = 0;
-            boolean groupWhenTimeout = false;
+            long lastFlushPosition = 0;       // 上次刷盘的位置
+            boolean groupWhenTimeout = false; // 是否进入批量刷盘超时分组流程
 
-            long dequeueStartTime = 0L;
-            long lastFlushTimeMs = System.currentTimeMillis();
+            long dequeueStartTime = 0L;       // dequeue操作的起始时间，用于性能统计
+            long lastFlushTimeMs = System.currentTimeMillis(); // 上次刷盘时间点
 
-            final ObjectHashSet<BookieRequestHandler> writeHandlers = new ObjectHashSet<>();
+            final ObjectHashSet<BookieRequestHandler> writeHandlers = new ObjectHashSet<>(); // 批量收集待刷盘回调handler
             QueueEntry[] localQueueEntries = new QueueEntry[conf.getJournalQueueSize()];
-            int localQueueEntriesIdx = 0;
-            int localQueueEntriesLen = 0;
-            QueueEntry qe = null;
+            int localQueueEntriesIdx = 0;     // 本地队列指针
+            int localQueueEntriesLen = 0;     // 本地队列长度
+            QueueEntry qe = null; // 当前处理的入队Journal条目
+
+            // 主journal处理循环
             while (true) {
-                // new journal file to write
+                // -------- 1. Journal文件创建或滚动 ---------
                 if (null == logFile) {
-                    logId = logId + 1;
+                    logId = logId + 1; // 新journal文件ID递增
                     journalIds = listJournalIds(journalDirectory, null);
+                    // 如果复用journal文件支持、数量超限并且最旧ID还在lastLogMark之前，则选择复用最老文件ID
                     Long replaceLogId = fileChannelProvider.supportReuseFile() && journalReuseFiles
-                        && journalIds.size() >= maxBackupJournals
-                        && journalIds.get(0) < lastLogMark.getCurMark().getLogFileId()
-                        ? journalIds.get(0) : null;
+                            && journalIds.size() >= maxBackupJournals
+                            && journalIds.get(0) < lastLogMark.getCurMark().getLogFileId()
+                            ? journalIds.get(0) : null;
 
+                    // 创建journal文件计时
                     journalCreationWatcher.reset().start();
-                    logFile = newLogFile(logId, replaceLogId);
-
+                    logFile = newLogFile(logId, replaceLogId); // 创建新journal文件或复用老文件
                     journalStats.getJournalCreationStats().registerSuccessfulEvent(
                             journalCreationWatcher.stop().elapsed(TimeUnit.NANOSECONDS), TimeUnit.NANOSECONDS);
 
-                    bc = logFile.getBufferedChannel();
-
-                    lastFlushPosition = bc.position();
+                    bc = logFile.getBufferedChannel(); // 获取journal底层写缓冲通道
+                    lastFlushPosition = bc.position(); // 初始化刷盘位置
                 }
 
+                // -------- 2. 获取待处理JournalEntry条目（出队） --------
                 if (qe == null) {
                     if (dequeueStartTime != 0) {
+                        // 记录队列等待时间
                         journalStats.getJournalProcessTimeStats()
-                            .registerSuccessfulEvent(MathUtils.elapsedNanos(dequeueStartTime), TimeUnit.NANOSECONDS);
+                                .registerSuccessfulEvent(MathUtils.elapsedNanos(dequeueStartTime), TimeUnit.NANOSECONDS);
                     }
 
-                    // At this point the local queue will always be empty, otherwise we would have
-                    // advanced to the next `qe` at the end of the loop
+                    // 本地队列每次清空，重新拉取queue
                     localQueueEntriesIdx = 0;
                     if (numEntriesToFlush == 0) {
-                        // There are no entries pending. We can wait indefinitely until the next
-                        // one is available
+                        // 如果没有pending entry，则一直阻塞等新条目到来
                         localQueueEntriesLen = queue.takeAll(localQueueEntries);
                     } else {
-                        // There are already some entries pending. We must adjust
-                        // the waiting time to the remaining groupWait time
+                        // 有pending entry，调整poll等待时长，最多等maxGroupWaitInNanos
                         long pollWaitTimeNanos = maxGroupWaitInNanos
                                 - MathUtils.elapsedNanos(toFlush.get(0).enqueueTime);
                         if (flushWhenQueueEmpty || pollWaitTimeNanos < 0) {
                             pollWaitTimeNanos = 0;
                         }
-
+                        // 指定短超时轮询
                         localQueueEntriesLen = queue.pollAll(localQueueEntries,
                                 pollWaitTimeNanos, TimeUnit.NANOSECONDS);
                     }
 
-                    dequeueStartTime = MathUtils.nowInNano();
+                    dequeueStartTime = MathUtils.nowInNano(); // 更新下次出队起始计时点
 
+                    // 若队列有新条目，选取第一个
                     if (localQueueEntriesLen > 0) {
                         qe = localQueueEntries[localQueueEntriesIdx];
                         localQueueEntries[localQueueEntriesIdx++] = null;
                     }
                 }
 
+                // -------- 3. 判断是否触发journal刷盘 --------
                 if (numEntriesToFlush > 0) {
                     boolean shouldFlush = false;
-                    // We should issue a forceWrite if any of the three conditions below holds good
-                    // 1. If the oldest pending entry has been pending for longer than the max wait time
+                    // Journal刷盘的触发条件有三种（只要满足任何之一就需要刷盘）：
+                    // 1. oldest pending entry超时等待
                     if (maxGroupWaitInNanos > 0 && !groupWhenTimeout && (MathUtils
                             .elapsedNanos(toFlush.get(0).enqueueTime) > maxGroupWaitInNanos)) {
                         groupWhenTimeout = true;
                     } else if (maxGroupWaitInNanos > 0 && groupWhenTimeout
-                        && (qe == null // no entry to group
+                            && (qe == null // 没有新entry可分组
                             || MathUtils.elapsedNanos(qe.enqueueTime) < maxGroupWaitInNanos)) {
-                        // when group timeout, it would be better to look forward, as there might be lots of
-                        // entries already timeout
-                        // due to a previous slow write (writing to filesystem which impacted by force write).
-                        // Group those entries in the queue
-                        // a) already timeout
-                        // b) limit the number of entries to group
+                        // 没有新条目延迟或者已达到批量分组超时阈值
                         groupWhenTimeout = false;
                         shouldFlush = true;
                         journalStats.getFlushMaxWaitCounter().inc();
                     } else if (qe != null
                             && ((bufferedEntriesThreshold > 0 && toFlush.size() > bufferedEntriesThreshold)
                             || (bc.position() > lastFlushPosition + bufferedWritesThreshold))) {
-                        // 2. If we have buffered more than the buffWriteThreshold or bufferedEntriesThreshold
+                        // 2. buffered entry数量超出阈值或buffer写入字节超阈，需要刷盘
                         groupWhenTimeout = false;
                         shouldFlush = true;
                         journalStats.getFlushMaxOutstandingBytesCounter().inc();
                     } else if (qe == null && flushWhenQueueEmpty) {
-                        // We should get here only if we flushWhenQueueEmpty is true else we would wait
-                        // for timeout that would put is past the maxWait threshold
-                        // 3. If the queue is empty i.e. no benefit of grouping. This happens when we have one
-                        // publish at a time - common case in tests.
+                        // 3. Journal队列为空且允许“空队列刷盘”，适用于测试或低吞吐场景
                         groupWhenTimeout = false;
                         shouldFlush = true;
                         journalStats.getFlushEmptyQueueCounter().inc();
                     }
 
-                    // toFlush is non null and not empty so should be safe to access getFirst
+                    // 刷盘处理
                     if (shouldFlush) {
+                        // V5及以上版本，写对齐填充字节
                         if (journalFormatVersionToWrite >= JournalChannel.V5) {
                             writePaddingBytes(logFile, paddingBuff, journalAlignmentSize);
                         }
                         journalFlushWatcher.reset().start();
-                        bc.flush();
+                        bc.flush(); // 刷写内存到文件
 
+                        // 处理toFlush中的所有entry：完成回调、释放资源
                         for (int i = 0; i < toFlush.size(); i++) {
                             QueueEntry entry = toFlush.get(i);
                             if (entry != null && (!syncData || entry.ackBeforeSync)) {
@@ -1102,9 +1101,10 @@ public class Journal implements CheckpointSource {
                                         && entry.entryId != BookieImpl.METAENTRY_ID_FORCE_LEDGER) {
                                     writeHandlers.add((BookieRequestHandler) entry.getCtx());
                                 }
-                                entry.run();
+                                entry.run(); // 回调
                             }
                         }
+                        // 刷新所有pending response
                         writeHandlers.forEach(
                                 (ObjectProcedure<? super BookieRequestHandler>)
                                         BookieRequestHandler::flushPendingResponse);
@@ -1114,97 +1114,98 @@ public class Journal implements CheckpointSource {
                         journalStats.getJournalFlushStats().registerSuccessfulEvent(
                                 journalFlushWatcher.stop().elapsed(TimeUnit.NANOSECONDS), TimeUnit.NANOSECONDS);
 
-                        // Trace the lifetime of entries through persistence
+                        // 如果debug模式，打印刷盘条目信息
                         if (LOG.isDebugEnabled()) {
                             for (QueueEntry e : toFlush) {
                                 if (e != null && LOG.isDebugEnabled()) {
                                     LOG.debug("Written and queuing for flush Ledger: {}  Entry: {}",
-                                              e.ledgerId, e.entryId);
+                                            e.ledgerId, e.entryId);
                                 }
                             }
                         }
 
+                        // 刷盘统计
                         journalStats.getForceWriteBatchEntriesStats()
-                            .registerSuccessfulValue(numEntriesToFlush);
+                                .registerSuccessfulValue(numEntriesToFlush);
                         journalStats.getForceWriteBatchBytesStats()
-                            .registerSuccessfulValue(batchSize);
+                                .registerSuccessfulValue(batchSize);
+
+                        // 检查journal是否需要rollover（文件太大）
                         boolean shouldRolloverJournal = (lastFlushPosition > maxJournalSize);
-                        // Trigger data sync to disk in the "Force-Write" thread.
-                        // Trigger data sync to disk has three situations:
-                        // 1. journalSyncData enabled, usually for SSD used as journal storage
-                        // 2. shouldRolloverJournal is true, that is the journal file reaches maxJournalSize
-                        // 3. if journalSyncData disabled and shouldRolloverJournal is false, we can use
-                        //   journalPageCacheFlushIntervalMSec to control sync frequency, preventing disk
-                        //   synchronize frequently, which will increase disk io util.
-                        //   when flush interval reaches journalPageCacheFlushIntervalMSec (default: 1s),
-                        //   it will trigger data sync to disk
+                        // 三种情形触发强制数据同步到磁盘（底层force write）：
+                        // 1. journalSyncData启用（目标为高可靠/高性能SSD场景）
+                        // 2. 文件大小超过最大限制
+                        // 3. 普通情况下，周期性触发，根据journalPageCacheFlushIntervalMSec控制间隔
                         if (syncData
                                 || shouldRolloverJournal
                                 || (System.currentTimeMillis() - lastFlushTimeMs
                                 >= journalPageCacheFlushIntervalMSec)) {
+                            // 放入刷盘请求队列，交给forceWriteThread处理
                             forceWriteRequests.put(createForceWriteRequest(logFile, logId, lastFlushPosition,
                                     toFlush, shouldRolloverJournal));
                             lastFlushTimeMs = System.currentTimeMillis();
                         }
-                        toFlush = entryListRecycler.newInstance();
+                        toFlush = entryListRecycler.newInstance(); // 刷完新建队列
                         numEntriesToFlush = 0;
-
                         batchSize = 0L;
-                        // check whether journal file is over file limit
+
+                        // 文件rollover时，关闭当前journal文件，进入新一轮创建流程
                         if (shouldRolloverJournal) {
-                            // if the journal file is rolled over, the journal file will be closed after last
-                            // entry is force written to disk.
                             logFile = null;
                             continue;
                         }
                     }
                 }
 
+                // -------- 4. 检查线程关闭 --------
                 if (!running) {
                     LOG.info("Journal Manager is asked to shut down, quit.");
                     break;
                 }
 
+                // -------- 5. 若无新queue entry，则进入下轮循环 --------
                 if (qe == null) { // no more queue entry
                     continue;
                 }
 
+                // 统计journal队列的大小和等待耗时
                 journalStats.getJournalQueueSize().dec();
                 journalStats.getJournalQueueStats()
                         .registerSuccessfulEvent(MathUtils.elapsedNanos(qe.enqueueTime), TimeUnit.NANOSECONDS);
 
+                // -------- 6. 按Journal格式和entry类型处理写入条目 --------
                 if ((qe.entryId == BookieImpl.METAENTRY_ID_LEDGER_EXPLICITLAC)
                         && (journalFormatVersionToWrite < JournalChannel.V6)) {
                     /*
-                     * this means we are using new code which supports
-                     * persisting explicitLac, but "journalFormatVersionToWrite"
-                     * is set to some older value (< V6). In this case we
-                     * shouldn't write this special entry
-                     * (METAENTRY_ID_LEDGER_EXPLICITLAC) to Journal.
+                     * 代码新版本支持explicitLac持久化，但实际journal文件格式老于V6，不允许写入该特殊entry
+                     * 所以直接释放资源、计数器，跳过写入
                      */
                     memoryLimitController.releaseMemory(qe.entry.readableBytes());
                     ReferenceCountUtil.release(qe.entry);
                 } else if (qe.entryId != BookieImpl.METAENTRY_ID_FORCE_LEDGER) {
+                    // 非“强制metaentry/forceLedger”类型，正常写入journal文件
                     int entrySize = qe.entry.readableBytes();
                     journalStats.getJournalWriteBytes().addCount(entrySize);
-
                     batchSize += (4 + entrySize);
 
                     lenBuff.clear();
                     lenBuff.writeInt(entrySize);
 
-                    // preAlloc based on size
+                    // 预分配journal文件空间
                     logFile.preAllocIfNeeded(4 + entrySize);
 
-                    bc.write(lenBuff);
-                    bc.write(qe.entry);
+                    bc.write(lenBuff); // 先写长度
+                    bc.write(qe.entry); // 再写内容本身
+                    // 释放内存页计数与引用
                     memoryLimitController.releaseMemory(qe.entry.readableBytes());
                     ReferenceCountUtil.release(qe.entry);
                 }
 
+                // -------- 7. 将条目加入pending flush队列 --------
                 toFlush.add(qe);
                 numEntriesToFlush++;
 
+                // -------- 8. move to next local queue entry --------
                 if (localQueueEntriesIdx < localQueueEntriesLen) {
                     qe = localQueueEntries[localQueueEntriesIdx];
                     localQueueEntries[localQueueEntriesIdx++] = null;
@@ -1218,11 +1219,7 @@ public class Journal implements CheckpointSource {
             Thread.currentThread().interrupt();
             LOG.info("Journal exits when shutting down");
         } finally {
-            // There could be packets queued for forceWrite on this logFile
-            // That is fine as this exception is going to anyway take down
-            // the bookie. If we execute this as a part of graceful shutdown,
-            // close will flush the file system cache making any previous
-            // cached writes durable so this is fine as well.
+            // 清理资源。关闭底层BufferedChannel，通知journal退出监听器
             IOUtils.close(LOG, bc);
             if (journalAliveListener != null) {
                 journalAliveListener.onJournalExit();
@@ -1230,6 +1227,7 @@ public class Journal implements CheckpointSource {
         }
         LOG.info("Journal exited loop!");
     }
+
 
     public BufferedChannelBuilder getBufferedChannelBuilder() {
         return (FileChannel fc, int capacity) -> new BufferedChannel(allocator, fc, capacity);

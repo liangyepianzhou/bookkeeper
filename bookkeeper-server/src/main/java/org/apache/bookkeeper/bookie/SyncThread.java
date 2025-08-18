@@ -99,31 +99,46 @@ class SyncThread implements Checkpointer {
         doCheckpoint(checkpoint);
     }
 
+    /**
+     * 提交一次 checkpoint（对ledger存储状态持久化）的异步请求。
+     *
+     * @param checkpoint Checkpoint对象，表示此次checkpoint的标记点
+     */
     protected void doCheckpoint(Checkpoint checkpoint) {
+        // 将checkpoint任务丢进后台线程池，由executor异步执行
         executor.submit(() -> {
-            long startTime = System.nanoTime();
+            long startTime = System.nanoTime(); // 记录任务起始时间
             try {
+                // 进入关键区间，防止flush/sync期间挂起
                 synchronized (suspensionLock) {
+                    // 如果外部已 suspend（暂停），则等待恢复
                     while (suspended) {
                         try {
-                            suspensionLock.wait();
+                            suspensionLock.wait(); // 挂起时等待被唤醒
                         } catch (InterruptedException e) {
+                            // 线程被中断：标记中断状态，重新进入循环判断
                             Thread.currentThread().interrupt();
                             continue;
                         }
                     }
                 }
+                // 若未关闭checkpoint功能，则执行一次刷盘（checkpoint）
                 if (!disableCheckpoint) {
                     checkpoint(checkpoint);
                 }
             } catch (Throwable t) {
+                // checkpoint过程如果出错，打印错误日志并触发“目录发生致命错误”报警
                 log.error("Exception in SyncThread", t);
                 dirsListener.fatalError();
             } finally {
-                syncExecutorTime.addLatency(MathUtils.elapsedNanos(startTime), TimeUnit.NANOSECONDS);
+                // 统计本次checkpoint的耗时
+                syncExecutorTime.addLatency(
+                        MathUtils.elapsedNanos(startTime),
+                        TimeUnit.NANOSECONDS);
             }
         });
     }
+
 
     public Future requestFlush() {
         return executor.submit(() -> {
@@ -133,6 +148,7 @@ class SyncThread implements Checkpointer {
             } catch (Throwable t) {
                 log.error("Exception flushing ledgers ", t);
             } finally {
+                // 把本次刷盘的耗时加到时间统计分布中，可用于后期性能监控，监测刷盘瓶颈。
                 syncExecutorTime.addLatency(MathUtils.elapsedNanos(startTime), TimeUnit.NANOSECONDS);
             }
         });

@@ -972,6 +972,8 @@ public class BookieImpl implements Bookie {
             // Force the load into masterKey cache
             byte[] oldValue = masterKeyCache.putIfAbsent(ledgerId, masterKey);
             if (oldValue == null) {
+                // 第一次遇到这个ledgerId，先写一条masterKey到journal
+                // bookie在重放journal、恢复数据、或者重启时，仍然能知道每个ledger的masterKey，从而安全、合法地访问和验证账本内容。
                 ByteBuf masterKeyEntry = createMasterKeyEntry(ledgerId, masterKey);
                 try {
                     getJournal(ledgerId).logAddEntry(

@@ -739,93 +739,115 @@ public class PerChannelBookieClient extends ChannelInboundHandlerAdapter {
     }
 
     /**
-     * This method should be called only after connection has been checked for
-     * {@link #connectIfNeededAndDoOp(GenericCallback)}.
+     * 发送写入请求（addEntry）到当前 bookie 的核心方法。
      *
-     * @param ledgerId
-     *          Ledger Id
-     * @param masterKey
-     *          Master Key
-     * @param entryId
-     *          Entry Id
-     * @param toSend
-     *          Buffer to send
-     * @param cb
-     *          Write callback
-     * @param ctx
-     *          Write callback context
-     * @param allowFastFail
-     *          allowFastFail flag
-     * @param writeFlags
-     *          WriteFlags
+     * 参数说明：
+     * - ledgerId：账本 ID
+     * - masterKey：账本主密钥（鉴权/加密用途）
+     * - entryId：条目 ID
+     * - toSend：要发送的内容，必须是 ReferenceCounted（ByteBuf 或 ByteBufList）
+     * - cb：写入完成回调
+     * - ctx：回调上下文
+     * - options：旧 V2 协议的标志位（如高优先级、恢复写等）
+     * - allowFastFail：在背压下是否允许快速失败（避免长时间等待不可写通道）
+     * - writeFlags：V3 协议的写入标志（如 DEFERRED_SYNC 等）
+     *
+     * 关键点：
+     * - 根据 useV2WireProtocol 走两条不同的编码路径（V2 旧线协议 vs V3 PB 协议）
+     * - 为每次写入注册一个 CompletionKey，用于匹配响应并触发回调
+     * - 正确管理 Netty 引用计数（retain/release），避免内存泄漏
+     * - 支持背压和快速失败策略
      */
     void addEntry(final long ledgerId, byte[] masterKey, final long entryId, ReferenceCounted toSend, WriteCallback cb,
                   Object ctx, final int options, boolean allowFastFail, final EnumSet<WriteFlag> writeFlags) {
-        Object request = null;
-        CompletionKey completionKey = null;
-        Runnable cleanupActionFailedBeforeWrite = null;
-        Runnable cleanupActionAfterWrite = null;
+        Object request = null;                       // 实际要写入到 channel 的请求对象（V2: ByteBuf/ByteBufList；V3: Protobuf Request）
+        CompletionKey completionKey = null;          // 用于匹配响应的完成键（V2: EntryCompletionKey；V3: TxnCompletionKey）
+        Runnable cleanupActionFailedBeforeWrite = null; // 写入还未提交到通道前失败时需要执行的清理动作（release）
+        Runnable cleanupActionAfterWrite = null;        // 写入成功提交后需要执行的清理动作（release）
+
         if (useV2WireProtocol) {
+            // V2 协议不支持某些 V3 才有的 WriteFlag（例如 DEFERRED_SYNC）
             if (writeFlags.contains(WriteFlag.DEFERRED_SYNC)) {
                 LOG.error("invalid writeflags {} for v2 protocol", writeFlags);
                 cb.writeComplete(BKException.Code.IllegalOpException, ledgerId, entryId, bookieId, ctx);
                 return;
             }
+
+            // V2 使用 (ledgerId, entryId) 作为完成键（非基于 txnId）
             completionKey = EntryCompletionKey.acquireV2Key(ledgerId, entryId, OperationType.ADD_ENTRY);
 
+            // V2 下直接发送原始 ByteBuf/ByteBufList（底层出站处理一般会在 write 完成后负责 release）
             if (toSend instanceof ByteBuf) {
+                // retainedDuplicate：共享同一底层内存但增加引用计数，避免修改原始 buffer 的读写指针
                 ByteBuf byteBuf = ((ByteBuf) toSend).retainedDuplicate();
                 request = byteBuf;
+                // 如果在 write 提交到 channel 之前失败，需要主动 release 以避免泄漏
                 cleanupActionFailedBeforeWrite = byteBuf::release;
             } else {
+                // ByteBufList 同样需要 retain，一般为零拷贝链式发送
                 ByteBufList byteBufList = (ByteBufList) toSend;
                 byteBufList.retain();
                 request = byteBufList;
                 cleanupActionFailedBeforeWrite = byteBufList::release;
             }
         } else {
+            // V3 协议引入 txnId 作为请求/响应匹配的标识，更灵活
             final long txnId = getTxnId();
             completionKey = new TxnCompletionKey(txnId, OperationType.ADD_ENTRY);
 
-            // Build the request and calculate the total size to be included in the packet.
+            // 构造 PB 头部：协议版本、操作类型、txnId
             BKPacketHeader.Builder headerBuilder = BKPacketHeader.newBuilder()
                     .setVersion(ProtocolVersion.VERSION_THREE)
                     .setOperation(OperationType.ADD_ENTRY)
                     .setTxnId(txnId);
+            // 兼容旧的 options：高优先级标志
             if (((short) options & BookieProtocol.FLAG_HIGH_PRIORITY) == BookieProtocol.FLAG_HIGH_PRIORITY) {
                 headerBuilder.setPriority(DEFAULT_HIGH_PRIORITY_VALUE);
             }
 
+            // 将要发送的负载转换为 ByteString（实现内部通常会做零拷贝包装或延迟拷贝）
             ByteBufList bufToSend = (ByteBufList) toSend;
             ByteString body = ByteStringUtil.byteBufListToByteString(bufToSend);
+            // 由于 body 可能引用底层 ByteBuf 的内容，需要在请求生命周期内保留引用
             bufToSend.retain();
             cleanupActionFailedBeforeWrite = bufToSend::release;
+            // V3 构造的 Request 对象在 write 提交后也需要释放底层 buf，因此 afterWrite 与失败前的清理一致
             cleanupActionAfterWrite = cleanupActionFailedBeforeWrite;
+
+            // 构造 AddRequest 载荷
             AddRequest.Builder addBuilder = AddRequest.newBuilder()
                     .setLedgerId(ledgerId)
                     .setEntryId(entryId)
-                    .setMasterKey(UnsafeByteOperations.unsafeWrap(masterKey))
+                    .setMasterKey(UnsafeByteOperations.unsafeWrap(masterKey)) // 避免多余拷贝
                     .setBody(body);
 
+            // 兼容旧的 options：恢复写标志
             if (((short) options & BookieProtocol.FLAG_RECOVERY_ADD) == BookieProtocol.FLAG_RECOVERY_ADD) {
                 addBuilder.setFlag(AddRequest.Flag.RECOVERY_ADD);
             }
 
+            // 仅在需要时设置 writeFlags，以便与不认识该字段的旧 bookie 保持兼容
             if (!writeFlags.isEmpty()) {
-                // add flags only if needed, in order to be able to talk with old bookies
                 addBuilder.setWriteFlags(WriteFlag.getWriteFlagsValue(writeFlags));
             }
 
+            // 包装请求并附加请求上下文（例如路由标签、追踪信息等）
             request = withRequestContext(Request.newBuilder())
                     .setHeader(headerBuilder)
                     .setAddRequest(addBuilder)
                     .build();
         }
 
+        // 在发送之前把 completionKey -> completion 对象注册到本地映射表，用于响应回来时完成回调
         putCompletionKeyValue(completionKey,
-                              AddCompletion.acquireAddCompletion(completionKey,
-                                                   cb, ctx, ledgerId, entryId, this));
-        // addEntry times out on backpressure
+                AddCompletion.acquireAddCompletion(completionKey,
+                        cb, ctx, ledgerId, entryId, this));
+
+        // 真正执行写入：
+        // - writeAndFlush 会将请求写入 Netty channel，并在背压下根据 allowFastFail 决定快速失败还是等待
+        // - cleanupActionFailedBeforeWrite：如果在写入提交到 channel 之前出错，执行清理释放引用
+        // - cleanupActionAfterWrite：当 write 已经提交（排队/刷出）后执行的清理，V3 场景中需要
+        // 说明：addEntry 在背压下支持超时（避免堆积），由 writeAndFlush 内部处理
         writeAndFlush(channel, completionKey, request, allowFastFail, cleanupActionFailedBeforeWrite,
                 cleanupActionAfterWrite);
     }

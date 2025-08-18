@@ -47,8 +47,23 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A {@code IndexPersistenceMgr} is responsible for managing the persistence state for the index in a bookie.
+ * IndexPersistenceMgr 是 BookKeeper 存储引擎中管理 Ledger 索引持久化的核心组件。
+ * 负责管理 Ledger 索引文件在磁盘上的读写、缓存、引用计数、文件迁移、回收等操作。
+ *
+ * 核心功能包括：
+ * 1. 索引文件的自动发现和初始化。
+ * 2. 文件缓存管理与引用计数，保证资源高效可控。
+ * 3. Ledger 元数据如 masterKey、LAC、Fenced 等相关读写。
+ * 4. 索引文件的自动迁移与删除（例如磁盘空间不足时）。
+ * 5. 支持多线程并发访问和缓存淘汰机制。
+ *
+ * 适用场景：
+ * - Bookie 启动/重启时索引文件自动发现。
+ * - 处理客户端写入或读取操作时的索引元数据持久化。
+ * - Ledger 的关闭、删除和回收流程。
+ *
  */
+
 public class IndexPersistenceMgr {
     private static final Logger LOG = LoggerFactory.getLogger(IndexPersistenceMgr.class);
 
@@ -69,21 +84,33 @@ public class IndexPersistenceMgr {
         return sb.toString();
     }
 
-    // use two separate cache for write and read
+    // writeFileInfoCache：维护处理写操作的 FileInfo 对象的缓存。
     final Cache<Long, CachedFileInfo> writeFileInfoCache;
+
+    // readFileInfoCache：维护处理读操作的 FileInfo 对象的缓存。
     final Cache<Long, CachedFileInfo> readFileInfoCache;
+
+    // fileInfoBackingCache：负责 FileInfo 对象的底层创建与文件资源管理。
     final FileInfoBackingCache fileInfoBackingCache;
 
+    // openFileLimit：Bookie 支持的最多打开文件数。
     final int openFileLimit;
+
+    // pageSize：一个索引页的字节大小。
     final int pageSize;
+
+    // entriesPerPage：每页可容纳的索引条目（即 entry 数量）。
     final int entriesPerPage;
 
-    // Manage all active ledgers in LedgerManager
-    // so LedgerManager has knowledge to garbage collect inactive/deleted ledgers
+    // activeLedgers：当前存活的 Ledger 集合，用于快速判定 Ledger 是否还在使用。
     final SnapshotMap<Long, Boolean> activeLedgers;
+
+    // ledgerDirsManager：管理 Ledger 索引文件所驻留的各个物理磁盘目录。
     final LedgerDirsManager ledgerDirsManager;
 
+    // persistenceMgrStats：索引持久化相关统计指标收集对象。
     private final IndexPersistenceMgrStats persistenceMgrStats;
+
 
     public IndexPersistenceMgr(int pageSize,
                                int entriesPerPage,
