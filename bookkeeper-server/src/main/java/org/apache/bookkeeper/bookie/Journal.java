@@ -764,39 +764,49 @@ public class Journal implements CheckpointSource {
     }
 
     /**
-     * Telling journal a checkpoint is finished.
+     * 当一次 checkpoint 完成后，通知 journal 进行后续处理。
+     * 该方法主要用来在数据安全持久化后，删除无用的旧 journal 文件，释放磁盘空间。
      *
+     * @param checkpoint  当前完成的 checkpoint 标记
+     * @param compact     是否执行紧凑操作（即是否触发删除历史 journal 文件）
      * @throws IOException
      */
     @Override
     public void checkpointComplete(Checkpoint checkpoint, boolean compact) throws IOException {
+        // 只处理 LogMarkCheckpoint 类型的 checkpoint
         if (!(checkpoint instanceof LogMarkCheckpoint)) {
-            return; // we didn't create this checkpoint, so dont do anything with it
+            return; // 如果不是我们关心的类型，直接返回，不做任何处理
         }
         LogMarkCheckpoint lmcheckpoint = (LogMarkCheckpoint) checkpoint;
         LastLogMark mark = lmcheckpoint.mark;
 
+        // 刷新当前日记的标记到磁盘（通常为持久化标记）
         mark.rollLog(mark);
-        if (compact) {
-            // list the journals that have been marked
+
+        if (compact) { // 若需要进行紧凑操作，才会删除旧 journal 文件
+            // 列出所有已被标记的 journal 文件（实际只列出当前已滚动且过期的日志）
             List<Long> logs = listJournalIds(journalDirectory, new JournalRollingFilter(mark));
-            // keep MAX_BACKUP_JOURNALS journal files before marked journal
+
+            // 只保留最近的 maxBackupJournals 个 journal 文件，其他的都删除掉
             if (logs.size() >= maxBackupJournals) {
                 int maxIdx = logs.size() - maxBackupJournals;
                 for (int i = 0; i < maxIdx; i++) {
                     long id = logs.get(i);
-                    // make sure the journal id is smaller than marked journal id
+                    // 只有当 journal 文件的 id 小于当前 mark 的日志文件 id，才删除
                     if (id < mark.getCurMark().getLogFileId()) {
                         File journalFile = new File(journalDirectory, Long.toHexString(id) + ".txn");
+                        // 执行文件删除操作，若失败则打印警告
                         if (!journalFile.delete()) {
                             LOG.warn("Could not delete old journal file {}", journalFile);
                         }
+                        // 每删除一个 journal 文件都打印日志（用于运维排查）
                         LOG.info("garbage collected journal " + journalFile.getName());
                     }
                 }
             }
         }
     }
+
 
     /**
      * Scan the journal.

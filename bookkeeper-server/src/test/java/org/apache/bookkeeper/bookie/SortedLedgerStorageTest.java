@@ -149,6 +149,35 @@ public class SortedLedgerStorageTest {
     }
 
     @Test
+    public void testLedgerExists() throws Exception {
+        long nonExistingLedgerId = 123456L;
+        assertFalse("Ledger should not exist", sortedLedgerStorage.ledgerExists(nonExistingLedgerId));
+
+        // Insert some ledger & entries in the interleaved storage
+        for (long entryId = 0; entryId < numWrites; entryId++) {
+            for (long ledgerId = 0; ledgerId < numOfLedgers; ledgerId++) {
+                if (entryId == 0) {
+                    sortedLedgerStorage.setMasterKey(ledgerId, ("ledger-" + ledgerId).getBytes());
+                    sortedLedgerStorage.setFenced(ledgerId);
+                }
+                ByteBuf entry = Unpooled.buffer(128);
+                entry.writeLong(ledgerId);
+                entry.writeLong(entryId * entriesPerWrite);
+                entry.writeBytes(("entry-" + entryId).getBytes());
+
+                sortedLedgerStorage.addEntry(entry);
+            }
+        }
+
+        for (long ledgerId = 0; ledgerId < numOfLedgers; ledgerId++) {
+            assertTrue("Ledger should exist", sortedLedgerStorage.ledgerExists(ledgerId));
+        }
+
+        nonExistingLedgerId = 456789L;
+        assertFalse("Ledger should not exist", sortedLedgerStorage.ledgerExists(nonExistingLedgerId));
+    }
+
+    @Test
     public void testGetListOfEntriesOfLedgerAfterFlush() throws IOException {
         // Insert some ledger & entries in the interleaved storage
         for (long entryId = 0; entryId < numWrites; entryId++) {

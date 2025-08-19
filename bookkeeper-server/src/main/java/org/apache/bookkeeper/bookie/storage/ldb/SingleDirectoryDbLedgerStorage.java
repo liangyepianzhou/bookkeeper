@@ -514,55 +514,73 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
         return entryId;
     }
 
+    /**
+     * 尝试向写缓存中添加新的Ledger条目，如果缓存已满则触发刷新（flush），
+     * 在指定的最大等待时间（maxThrottleTimeNanos）内重复尝试，超过则拒绝写入。
+     *
+     * @param ledgerId  账本ID
+     * @param entryId   条目ID
+     * @param entry     条目内容
+     * @throws IOException
+     * @throws BookieException
+     */
     private void triggerFlushAndAddEntry(long ledgerId, long entryId, ByteBuf entry)
             throws IOException, BookieException {
+        // 开始限流计时的时间点
         long throttledStartTime = MathUtils.nowInNano();
+        // 增加统计：限流写请求次数计数器 +1
         dbLedgerStorageStats.getThrottledWriteRequests().inc();
+        // 计算限流的绝对超时时间（纳秒）
         long absoluteTimeoutNanos = System.nanoTime() + maxThrottleTimeNanos;
 
+        // 循环直到超时，期间不断尝试写入缓存
         while (System.nanoTime() < absoluteTimeoutNanos) {
-            // Write cache is full, we need to trigger a flush so that it gets rotated
-            // If the flush has already been triggered or flush has already switched the
-            // cache, we don't need to trigger another flush
+            // 如果写缓存已满且当前未在进行flush动作
+            // hasFlushBeenTriggered通过CAS保证只触发一次flush
             if (!isFlushOngoing.get() && hasFlushBeenTriggered.compareAndSet(false, true)) {
-                // Trigger an early flush in background
-                log.info("Write cache is full, triggering flush");
+                // 通过线程池异步触发一次flush操作
+                log.info("写缓存已满，触发flush");
                 executor.execute(() -> {
-                        long startTime = System.nanoTime();
-                        try {
-                            flush();
-                        } catch (IOException e) {
-                            log.error("Error during flush", e);
-                        } finally {
-                            flushExecutorTime.addLatency(MathUtils.elapsedNanos(startTime), TimeUnit.NANOSECONDS);
-                        }
-                    });
+                    long startTime = System.nanoTime();
+                    try {
+                        flush(); // 执行实际的flush操作
+                    } catch (IOException e) {
+                        log.error("flush过程中发生异常", e);
+                    } finally {
+                        // 统计flush执行时间
+                        flushExecutorTime.addLatency(MathUtils.elapsedNanos(startTime), TimeUnit.NANOSECONDS);
+                    }
+                });
             }
 
+            // 获取写缓存读锁，进行插入操作
             long stamp = writeCacheRotationLock.readLock();
             try {
+                // 尝试将entry写入缓存
                 if (writeCache.put(ledgerId, entryId, entry)) {
-                    // We succeeded in putting the entry in write cache in the
+                    // 成功写入缓存，记录统计
                     recordSuccessfulEvent(dbLedgerStorageStats.getThrottledWriteStats(), throttledStartTime);
-                    return;
+                    return; // 写入成功，直接返回
                 }
             } finally {
+                // 释放缓存读锁
                 writeCacheRotationLock.unlockRead(stamp);
             }
 
-            // Wait some time and try again
+            // 没成功则稍作等待再重试，避免CPU空转
             try {
-                Thread.sleep(1);
+                Thread.sleep(1); // 休眠1毫秒进行重试
             } catch (InterruptedException e) {
+                // 若线程被中断，则抛异常
                 Thread.currentThread().interrupt();
-                throw new IOException("Interrupted when adding entry " + ledgerId + "@" + entryId);
+                throw new IOException("向写缓存添加 entry 时线程被中断 " + ledgerId + "@" + entryId);
             }
         }
 
-        // Timeout expired and we weren't able to insert in write cache
-        dbLedgerStorageStats.getRejectedWriteRequests().inc();
-        recordFailedEvent(dbLedgerStorageStats.getThrottledWriteStats(), throttledStartTime);
-        throw new OperationRejectedException();
+        // 超时未能写入缓存，拒绝此次写操作
+        dbLedgerStorageStats.getRejectedWriteRequests().inc(); // 统计拒绝次数
+        recordFailedEvent(dbLedgerStorageStats.getThrottledWriteStats(), throttledStartTime); // 统计失败事件
+        throw new OperationRejectedException(); // 通过异常通知调用方
     }
 
     @Override
@@ -794,49 +812,60 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
 
     @Override
     public void checkpoint(Checkpoint checkpoint) throws IOException {
+        // 生成一个新的 checkpoint，并记录当前 checkpoint 状态
         Checkpoint thisCheckpoint = checkpointSource.newCheckpoint();
+
+        // 如果上一次 checkpoint 比本次要早（已经 flush），直接跳过
         if (lastCheckpoint.compareTo(checkpoint) > 0) {
             return;
         }
 
-        // Only a single flush operation can happen at a time
+        // 只允许同时有一个 flush 操作进行，获取互斥锁
         flushMutex.lock();
         long startTime = -1;
         try {
+            // 记录此次 flush 的开始纳秒时间
             startTime = MathUtils.nowInNano();
         } catch (Throwable e) {
-            // Fix spotbugs warning. Should never happen
+            // 异常处理，理论不会出现，仅为 spotbugs 检查
             flushMutex.unlock();
             throw new IOException(e);
         }
 
         try {
+            // 写缓存为空，无需 flush
             if (writeCache.isEmpty()) {
                 return;
             }
-            // Swap the write cache so that writes can continue to happen while the flush is
-            // ongoing
+            // 交换 write 缓存，将需要 flush 的数据移动到独立区域，写线程可继续写入
             swapWriteCache();
 
+            // 记录需要刷写的数据总大小
             long sizeToFlush = writeCacheBeingFlushed.size();
             if (log.isDebugEnabled()) {
-                log.debug("Flushing entries. count: {} -- size {} Mb", writeCacheBeingFlushed.count(),
+                log.debug("Flushing entries. count: {} -- size {} Mb",
+                        writeCacheBeingFlushed.count(),
                         sizeToFlush / 1024.0 / 1024);
             }
 
-            // Write all the pending entries into the entry logger and collect the offset
-            // position for each entry
+            // 写入所有待持久化的 entry 到 entry log，并收集每条 entry 的物理位置(offset)
 
+            // 开启一个批量操作，后续对 entryLocationIndex 批量提交
             try (Batch batch = entryLocationIndex.newBatch()) {
+                // 遍历所有待持久化的 entry
                 writeCacheBeingFlushed.forEach((ledgerId, entryId, entry) -> {
+                    // 将 entry 写入 entrylog，并返回物理位置
                     long location = entryLogger.addEntry(ledgerId, entry);
+                    // 将 location 写入索引（批量，未flush）
                     entryLocationIndex.addLocation(batch, ledgerId, entryId, location);
                 });
 
+                // 刷新 entrylog 文件，将数据真正写入磁盘
                 long entryLoggerStart = MathUtils.nowInNano();
                 entryLogger.flush();
                 recordSuccessfulEvent(dbLedgerStorageStats.getFlushEntryLogStats(), entryLoggerStart);
 
+                // 刷新批量索引到持久化存储
                 long batchFlushStartTime = MathUtils.nowInNano();
                 batch.flush();
 
@@ -847,15 +876,18 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
                 }
             }
 
+            // 刷新 ledgerIndex（ledger元数据索引），确保元数据也落盘
             long ledgerIndexStartTime = MathUtils.nowInNano();
             ledgerIndex.flush();
             recordSuccessfulEvent(dbLedgerStorageStats.getFlushLedgerIndexStats(), ledgerIndexStartTime);
 
+            // 更新 checkpoint 状态
             lastCheckpoint = thisCheckpoint;
 
-            // Discard all the entry from the write cache, since they're now persisted
+            // 清空已持久化的临时缓存
             writeCacheBeingFlushed.clear();
 
+            // 统计本次刷新时间和吞吐
             double flushTimeSeconds = MathUtils.elapsedNanos(startTime) / (double) TimeUnit.SECONDS.toNanos(1);
             double flushThroughput = sizeToFlush / 1024.0 / 1024.0 / flushTimeSeconds;
 
@@ -863,35 +895,41 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
                 log.debug("Flushing done time {} s -- Written {} MB/s", flushTimeSeconds, flushThroughput);
             }
 
+            // 记录 flush 的成功事件和数据量
             recordSuccessfulEvent(dbLedgerStorageStats.getFlushStats(), startTime);
             dbLedgerStorageStats.getFlushSizeStats().registerSuccessfulValue(sizeToFlush);
+
         } catch (IOException e) {
+            // 记录异常, 并抛出
             recordFailedEvent(dbLedgerStorageStats.getFlushStats(), startTime);
-            // Leave IOException as it is
             throw e;
         } finally {
             try {
+                // 标记 flush 结束后，异步清理已删除 ledgers 的索引
                 cleanupExecutor.execute(() -> {
-                    // There can only be one single cleanup task running because the cleanupExecutor
-                    // is single-threaded
+                    // cleanupExecutor 是单线程的，保证仅有一个清理任务同时执行
                     try {
                         if (log.isDebugEnabled()) {
                             log.debug("Removing deleted ledgers from db indexes");
                         }
-
+                        // 删除已被标记删除的 ledger 的 entry offset 索引
                         entryLocationIndex.removeOffsetFromDeletedLedgers();
+                        // 删除已被标记删除的 ledger 的元数据索引
                         ledgerIndex.removeDeletedLedgers();
                     } catch (Throwable t) {
                         log.warn("Failed to cleanup db indexes", t);
                     }
                 });
 
+                // 标记 flush 已经结束
                 isFlushOngoing.set(false);
             } finally {
+                // 最后释放互斥锁
                 flushMutex.unlock();
             }
         }
     }
+
 
     /**
      * Swap the current write cache with the replacement cache.
