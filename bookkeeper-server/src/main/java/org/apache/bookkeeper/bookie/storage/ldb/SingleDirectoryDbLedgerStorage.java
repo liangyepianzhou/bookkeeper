@@ -1189,9 +1189,16 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
                 "getListOfEntriesOfLedger method is currently unsupported for SingleDirectoryDbLedgerStorage");
     }
 
+    /**
+     * 返回 LedgerDirsListener 监听器，根据磁盘空间变化(满/可写/警告等)，自动管理垃圾回收（GC）线程的行为。
+     */
     private LedgerDirsManager.LedgerDirsListener getLedgerDirsListener() {
         return new LedgerDirsListener() {
-
+            /**
+             * 当某个磁盘空间接近满时触发。
+             * 如果允许在无空间时强制GC，则开启强制GC；
+             * 否则，暂停Major GC（大GC）。
+             */
             @Override
             public void diskAlmostFull(File disk) {
                 if (gcThread.isForceGCAllowWhenNoSpace()) {
@@ -1201,6 +1208,11 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
                 }
             }
 
+            /**
+             * 当某个磁盘空间彻底满了时触发。
+             * 如果允许无空间强制GC，则开启强制GC；
+             * 否则，同时暂停Major GC和Minor GC，以防再次写入导致进一步错误。
+             */
             @Override
             public void diskFull(File disk) {
                 if (gcThread.isForceGCAllowWhenNoSpace()) {
@@ -1211,6 +1223,11 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
                 }
             }
 
+            /**
+             * 当所有磁盘都满了时触发。
+             * 如果允许无空间强制GC，则开启强制GC；
+             * 否则，暂停所有GC压缩（Major和Minor）。
+             */
             @Override
             public void allDisksFull(boolean highPriorityWritesAllowed) {
                 if (gcThread.isForceGCAllowWhenNoSpace()) {
@@ -1221,31 +1238,42 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
                 }
             }
 
+            /**
+             * 当某个磁盘恢复可写（空间充足）时触发。
+             * 如果之前开启了强制GC，现在关闭强制GC；
+             * 否则，恢复正常的Major GC和Minor GC压缩。
+             */
             @Override
             public void diskWritable(File disk) {
-                // we have enough space now
+                // 当前空间已恢复，GC可以恢复正常
                 if (gcThread.isForceGCAllowWhenNoSpace()) {
-                    // disable force gc.
+                    // 关闭强制GC
                     gcThread.disableForceGC();
                 } else {
-                    // resume compaction to normal.
+                    // 恢复正常的GC行为
                     gcThread.resumeMajorGC();
                     gcThread.resumeMinorGC();
                 }
             }
 
+            /**
+             * 当磁盘刚刚达到可写阈值（但仍比较危险）时触发。
+             * 如果允许无空间时强制GC，则继续保持强制GC；
+             * 否则，仅恢复Minor GC（小GC），Major GC仍暂停。
+             */
             @Override
             public void diskJustWritable(File disk) {
                 if (gcThread.isForceGCAllowWhenNoSpace()) {
-                    // if a disk is just writable, we still need force gc.
+                    // 虽然磁盘刚可写，但还需强制GC
                     gcThread.enableForceGC();
                 } else {
-                    // still under warn threshold, only resume minor compaction.
+                    // 只恢复Minor GC，大GC仍需控制
                     gcThread.resumeMinorGC();
                 }
             }
         };
     }
+
 
     @Override
     public void setLimboState(long ledgerId) throws IOException {

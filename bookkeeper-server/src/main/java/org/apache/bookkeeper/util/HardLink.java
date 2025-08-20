@@ -415,61 +415,71 @@ public class HardLink {
   }
 
   /**
-   * Creates a hardlink.
-   * @param file - existing source file
-   * @param linkName - desired target link file
+   * 创建硬链接（hardlink）。
+   *
+   * 硬链接是指在文件系统中为同一个物理文件建立多个目录项路径，
+   * 这样任何一个路径内容变化会影响到原始文件（包括其它硬链接）。
+   *
+   * 方法优先采用 Java NIO 提供的 Files.createLink，如果运行环境不支持，则采用 shell 命令（如 ln）方式创建。
+   * 两种方式均失败时抛出 IOException。
+   *
+   * @param file     已存在的源文件
+   * @param linkName 希望创建的目标硬链接文件路径
+   * @throws IOException 创建硬链接失败时抛出异常
    */
   public static void createHardLink(File file, File linkName)
-  throws IOException {
+          throws IOException {
     if (file == null) {
       throw new IOException(
-          "invalid arguments to createHardLink: source file is null");
+              "invalid arguments to createHardLink: source file is null");
     }
     if (linkName == null) {
       throw new IOException(
-          "invalid arguments to createHardLink: link name is null");
+              "invalid arguments to createHardLink: link name is null");
     }
 
-    // if createLink available try first, else fall back to shell command.
+    // 优先尝试 Java NIO 的 createLink API
+    // CREATE_LINK_SUPPORTED 参数用于标记当前环境是否支持该方法（为提升性能，不重复尝试失败的API）
     if (CREATE_LINK_SUPPORTED.get()) {
       try {
         Path newFile = Files.createLink(linkName.toPath(), file.toPath());
         if (newFile.toFile().exists()) {
-          return;
+          return; // 创建成功，直接返回
         }
       } catch (UnsupportedOperationException e) {
-        LOG.error("createLink not supported", e);
-        CREATE_LINK_SUPPORTED.set(false);
+        LOG.error("createLink not supported", e);        // 环境不支持该方法
+        CREATE_LINK_SUPPORTED.set(false);                // 标记为不支持，后续都用 shell
       } catch (IOException e) {
-        LOG.error("error when create hard link use createLink", e);
-        CREATE_LINK_SUPPORTED.set(false);
+        LOG.error("error when create hard link use createLink", e); // API异常
+        CREATE_LINK_SUPPORTED.set(false);                          // 标记为不支持
       }
     }
 
-    // construct and execute shell command
-    String[] hardLinkCommand = getHardLinkCommand.linkOne(file, linkName);
+    // 若 API 不支持则使用 shell 命令（如 Unix 的 ln 命令）创建硬链接
+    String[] hardLinkCommand = getHardLinkCommand.linkOne(file, linkName); // 获取创建硬链接命令
     Process process = Runtime.getRuntime().exec(hardLinkCommand);
     try {
+      // 等待命令执行完成，并判断执行结果
       if (process.waitFor() != 0) {
-        String errMsg = new BufferedReader(new InputStreamReader(
-                                                   process.getInputStream(), UTF_8)).readLine();
+        // 读取标准输出和标准错误，拼接为异常消息，方便排查失败原因
+        String errMsg = new BufferedReader(new InputStreamReader(process.getInputStream(), UTF_8)).readLine();
         if (errMsg == null) {
-            errMsg = "";
+          errMsg = "";
         }
-        String inpMsg = new BufferedReader(new InputStreamReader(
-                                                   process.getErrorStream(), UTF_8)).readLine();
+        String inpMsg = new BufferedReader(new InputStreamReader(process.getErrorStream(), UTF_8)).readLine();
         if (inpMsg == null) {
-            inpMsg = "";
+          inpMsg = "";
         }
-        throw new IOException(errMsg + inpMsg);
+        throw new IOException(errMsg + inpMsg); // 创建硬链接失败，抛出异常
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      throw new IOException(e);
+      throw new IOException(e); // 被中断异常，转为 IOException 抛出
     } finally {
-      process.destroy();
+      process.destroy(); // 及时关闭进程资源
     }
   }
+
 
   /**
    * Creates hardlinks from multiple existing files within one parent

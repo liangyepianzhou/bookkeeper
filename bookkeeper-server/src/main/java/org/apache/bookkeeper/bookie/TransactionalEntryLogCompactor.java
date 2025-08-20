@@ -75,40 +75,64 @@ public class TransactionalEntryLogCompactor extends AbstractLogCompactor {
         }
     }
 
+    /**
+     * 对指定 entry log 文件执行数据压缩（compaction）流程。
+     *
+     * 压缩的目的是将 entry log 文件中 remaining size percentage（还在使用的 ledger 数据）迁移到新的 compact log，
+     * 达到有效清理/复用空间的目的。
+     *
+     * 主要流程分为三个阶段，任何一个阶段失败，均中止当前 entry log 的压缩：
+     * 1. ScanEntryLogPhase   : 遍历原 entry log，找到所有还在使用的 ledger 数据（remaining size percentage的部分）并迁移到新的 compaction log。
+     * 2. FlushCompactionLogPhase : 将 compaction log 中的数据（迁移的 ledger 记录）落盘，确保新日志文件稳定可靠。
+     * 3. UpdateIndexPhase       : 更新索引，将 ledger 映射更新为新的 log 文件 id，保证系统后续访问 ledger 能定位到新日志文件。
+     *
+     * 日志打印会记录每个阶段的起止、异常等信息，便于故障排查与运维。
+     *
+     * @param metadata EntryLogMetadata，指定要压缩的 entry log 文件元数据
+     * @return true 表示压缩成功；false 表示压缩过程中有任意阶段失败
+     */
     @Override
     public boolean compact(EntryLogMetadata metadata) {
         if (metadata != null) {
             LOG.info("Compacting entry log {} with usage {}.",
-                metadata.getEntryLogId(), metadata.getUsage());
+                    metadata.getEntryLogId(), metadata.getUsage()); // usage 表示剩余还在用的数据比例 remaining size percentage
+
             CompactionEntryLog compactionLog;
             try {
+                // 创建用于压缩数据迁移的新日志文件对象
                 compactionLog = entryLogger.newCompactionLog(metadata.getEntryLogId());
             } catch (IOException ioe) {
                 LOG.error("Exception creating new compaction entry log", ioe);
                 return false;
             }
+
+            // 第一阶段：扫描原 entry log，迁移所有剩余有效 ledger 数据
             CompactionPhase scanEntryLog = new ScanEntryLogPhase(metadata, compactionLog);
             if (!scanEntryLog.run()) {
                 LOG.info("Compaction for entry log {} end in ScanEntryLogPhase.", metadata.getEntryLogId());
                 return false;
             }
 
+            // 第二阶段：落盘新的 compaction log，确保数据可靠持久化
             CompactionPhase flushCompactionLog = new FlushCompactionLogPhase(compactionLog);
             if (!flushCompactionLog.run()) {
                 LOG.info("Compaction for entry log {} end in FlushCompactionLogPhase.", metadata.getEntryLogId());
                 return false;
             }
 
+            // 第三阶段：更新 ledger 到 entry log 的索引指向，便于后续读写定位
             CompactionPhase updateIndex = new UpdateIndexPhase(compactionLog);
             if (!updateIndex.run()) {
                 LOG.info("Compaction for entry log {} end in UpdateIndexPhase.", metadata.getEntryLogId());
                 return false;
             }
-            LOG.info("Compacted entry log : {}.", metadata.getEntryLogId());
+
+            LOG.info("Compacted entry log : {}.", metadata.getEntryLogId()); // 全流程成功
             return true;
         }
         return false;
     }
+
 
     /**
      * An abstract class that would be extended to be the actual transactional phases for compaction.

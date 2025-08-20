@@ -430,36 +430,50 @@ public class GarbageCollectorThread implements Runnable {
         runWithFlags(force, suspendMajor, suspendMinor);
     }
 
+    /**
+     * 执行带有控制标志的垃圾回收线程主入口。
+     * @param force 是否强制执行 GC，忽略等待时间
+     * @param suspendMajor 是否挂起 major compaction（主压缩）
+     * @param suspendMinor 是否挂起 minor compaction（次压缩）
+     */
     public void runWithFlags(boolean force, boolean suspendMajor, boolean suspendMinor) {
+        // 记录线程启动时刻，用于统计耗时
         long threadStart = MathUtils.nowInNano();
+
         if (force) {
             LOG.info("Garbage collector thread forced to perform GC before expiry of wait time.");
         }
-        // Recover and clean up previous state if using transactional compaction
+
+        // 如果采用事务性压缩，先进行恢复与清理工作，避免前一次异常遗留
         compactor.cleanUpAndRecover();
 
         try {
-            // gc inactive/deleted ledgers
-            // this is used in extractMetaFromEntryLogs to calculate the usage of entry log
+            // 1. 回收无效（inactive/deleted）账本对应的 ledger
+            //    在 extractMetaFromEntryLogs 中会依赖它来精准计算 entry log 使用占比
             doGcLedgers();
 
-
+            // 2. 提取 entry log 的元数据信息
             long extractMetaStart = MathUtils.nowInNano();
             try {
-                // Extract all of the ledger ID's that comprise all of the entry logs
-                // (except for the current new one which is still being written to).
+                // 解析所有 entry log（不包括仍在写入的当前 log）中承载哪些 ledger 的信息
                 extractMetaFromEntryLogs();
 
-                // gc entry logs
+                // 回收 entry log 文件，
+                // 这里主要是进行统计工作，entry log日志回收逻辑在extractMetaFromEntryLogs已经进行了一遍，
+                // 即检查entry log 中的ledger的存活状态，然后删除没有ledger关联的entry log
                 doGcEntryLogs();
+
+                // 提取元数据阶段计时统计：成功
                 gcStats.getExtractMetaRuntime()
                         .registerSuccessfulEvent(MathUtils.elapsedNanos(extractMetaStart), TimeUnit.NANOSECONDS);
             } catch (EntryLogMetadataMapException e) {
+                // 提取元数据阶段计时统计：失败
                 gcStats.getExtractMetaRuntime()
                         .registerFailedEvent(MathUtils.elapsedNanos(extractMetaStart), TimeUnit.NANOSECONDS);
                 throw e;
             }
 
+            // 根据磁盘空间情况，考虑是否需要中止大或小压缩
             if (suspendMajor) {
                 LOG.info("Disk almost full, suspend major compaction to slow down filling disk.");
             }
@@ -467,39 +481,46 @@ public class GarbageCollectorThread implements Runnable {
                 LOG.info("Disk full, suspend minor compaction to slow down filling disk.");
             }
 
+            // 3. Compaction 部分
             long curTime = System.currentTimeMillis();
             long compactStart = MathUtils.nowInNano();
-            if (((isForceMajorCompactionAllow && force) || (enableMajorCompaction
-                    && (force || curTime - lastMajorCompactionTime > majorCompactionInterval)))
+
+            // 判断是否允许进行 major compaction（主压缩）
+            // 条件：允许强制+force 或配置开启majorCompaction，并满足时间间隔且未挂起
+            if (((isForceMajorCompactionAllow && force) ||
+                    (enableMajorCompaction && (force || curTime - lastMajorCompactionTime > majorCompactionInterval)))
                     && (!suspendMajor)) {
-                // enter major compaction
+                // 进入 major compaction（主压缩逻辑）
                 LOG.info("Enter major compaction, suspendMajor {}, lastMajorCompactionTime {}", suspendMajor,
                         lastMajorCompactionTime);
                 majorCompacting.set(true);
                 try {
                     doCompactEntryLogs(majorCompactionThreshold, majorCompactionMaxTimeMillis);
                 } catch (EntryLogMetadataMapException e) {
+                    // 主压缩失败，统计异常
                     gcStats.getCompactRuntime()
                             .registerFailedEvent(MathUtils.elapsedNanos(compactStart), TimeUnit.NANOSECONDS);
                     throw e;
                 } finally {
+                    // 刷新主/次压缩时间标记、计数器复位
                     lastMajorCompactionTime = System.currentTimeMillis();
-                    // and also move minor compaction time
                     lastMinorCompactionTime = lastMajorCompactionTime;
                     gcStats.getMajorCompactionCounter().inc();
                     majorCompacting.set(false);
                 }
 
-            } else if (((isForceMinorCompactionAllow && force) || (enableMinorCompaction
-                    && (force || curTime - lastMinorCompactionTime > minorCompactionInterval)))
+                // 判断是否允许进行 minor compaction（主压缩）
+            } else if (((isForceMinorCompactionAllow && force) ||
+                    (enableMinorCompaction && (force || curTime - lastMinorCompactionTime > minorCompactionInterval)))
                     && (!suspendMinor)) {
-                // enter minor compaction
+                // 进入 minor compaction（次压缩逻辑）
                 LOG.info("Enter minor compaction, suspendMinor {}, lastMinorCompactionTime {}", suspendMinor,
                         lastMinorCompactionTime);
                 minorCompacting.set(true);
                 try {
                     doCompactEntryLogs(minorCompactionThreshold, minorCompactionMaxTimeMillis);
-                }  catch (EntryLogMetadataMapException e) {
+                } catch (EntryLogMetadataMapException e) {
+                    // 次压缩失败，统计异常
                     gcStats.getCompactRuntime()
                             .registerFailedEvent(MathUtils.elapsedNanos(compactStart), TimeUnit.NANOSECONDS);
                     throw e;
@@ -509,35 +530,43 @@ public class GarbageCollectorThread implements Runnable {
                     minorCompacting.set(false);
                 }
             }
-            if (entryLocationCompactionInterval > 0 && (curTime - lastEntryLocationCompactionTime > (
-                    entryLocationCompactionInterval + randomCompactionDelay))) {
-                // enter entry location compaction
-                LOG.info(
-                        "Enter entry location compaction, entryLocationCompactionInterval {}, randomCompactionDelay "
-                                + "{}, lastEntryLocationCompactionTime {}",
+
+            // 4. entry location compaction ~ 每隔一段时间清理 entry location
+            // 条件：配置不为0，且距离上次执行已隔够 interval+随机延迟
+            if (entryLocationCompactionInterval > 0 &&
+                    (curTime - lastEntryLocationCompactionTime > (entryLocationCompactionInterval + randomCompactionDelay))) {
+                LOG.info("Enter entry location compaction, entryLocationCompactionInterval {}, randomCompactionDelay {}, lastEntryLocationCompactionTime {}",
                         entryLocationCompactionInterval, randomCompactionDelay, lastEntryLocationCompactionTime);
                 ledgerStorage.entryLocationCompact();
                 lastEntryLocationCompactionTime = System.currentTimeMillis();
+
+                // 随机化下一次 compaction 的触发间隔，避免热点
                 randomCompactionDelay = ThreadLocalRandom.current().nextLong(entryLocationCompactionInterval);
-                LOG.info("Next entry location compaction interval {}",
-                        entryLocationCompactionInterval + randomCompactionDelay);
+                LOG.info("Next entry location compaction interval {}", entryLocationCompactionInterval + randomCompactionDelay);
+
                 gcStats.getEntryLocationCompactionCounter().inc();
             }
+
+            // 统计压缩总耗时（只统计成功情况）
             gcStats.getCompactRuntime()
                     .registerSuccessfulEvent(MathUtils.elapsedNanos(compactStart), TimeUnit.NANOSECONDS);
+
+            // 统计整个 GC 线程耗时（成功）
             gcStats.getGcThreadRuntime().registerSuccessfulEvent(
                     MathUtils.nowInNano() - threadStart, TimeUnit.NANOSECONDS);
+
         } catch (EntryLogMetadataMapException e) {
-            LOG.error("Error in entryLog-metadatamap, Failed to complete GC/Compaction due to entry-log {}",
-                    e.getMessage(), e);
-            gcStats.getGcThreadRuntime().registerFailedEvent(MathUtils.elapsedNanos(threadStart), TimeUnit.NANOSECONDS);
+            // 捕获元数据相关异常，登记失败，并记录日志
+            LOG.error("Error in entryLog-metadatamap, Failed to complete GC/Compaction due to entry-log {}", e.getMessage(), e);
+            gcStats.getGcThreadRuntime().registerFailedEvent(
+                    MathUtils.elapsedNanos(threadStart), TimeUnit.NANOSECONDS);
         } finally {
+            // 强制 GC 后将 force 标志重新置为 false，避免漏掉下次强制
             if (force && forceGarbageCollection.compareAndSet(true, false)) {
                 LOG.info("{} Set forceGarbageCollection to false after force GC to make it forceGC-able again.",
                         Thread.currentThread().getName());
             }
         }
-
     }
 
     /**
@@ -557,44 +586,49 @@ public class GarbageCollectorThread implements Runnable {
     }
 
     /**
-     * Garbage collect those entry loggers which are not associated with any active ledgers.
+     * 垃圾回收不再关联任何活动 ledger 的 entry log 文件。
      */
     private void doGcEntryLogs() throws EntryLogMetadataMapException {
-        // Get a cumulative count, don't update until complete
+        // 统计活跃的 entry log 大小和所有 entry log 的总大小，直到本轮 GC 完成后再统一更新
         AtomicLong activeEntryLogSizeAcc = new AtomicLong(0L);
         AtomicLong totalEntryLogSizeAcc = new AtomicLong(0L);
 
-        // Loop through all of the entry logs and remove the non-active ledgers.
+        // 遍历所有 entry log 文件的元数据，清理已经没有被任何活动 ledger 所引用的文件
         entryLogMetaMap.forEach((entryLogId, meta) -> {
             try {
+                // 移除 entry log 文件中不存在的 ledger，返回是否有修改
                 boolean modified = removeIfLedgerNotExists(meta);
                 if (meta.isEmpty()) {
-                    // This means the entry log is not associated with any active
-                    // ledgers anymore.
-                    // We can remove this entry log file now.
-                    LOG.info("Deleting entryLogId {} as it has no active ledgers!", entryLogId);
+                    // 如果 entry log 文件已不再关联任何活动 ledger
+                    // 可以安全地删除该 entry log 文件，释放磁盘空间
+                    LOG.info("删除 entryLogId {}，因为其没有任何活动 ledger！", entryLogId);
                     if (removeEntryLog(entryLogId)) {
+                        // 删除文件成功，累计被回收的空间
                         gcStats.getReclaimedSpaceViaDeletes().addCount(meta.getTotalSize());
                     } else {
+                        // 删除失败，累计失败次数
                         gcStats.getReclaimFailedToDelete().inc();
                     }
                 } else if (modified) {
-                    // update entryLogMetaMap only when the meta modified.
+                    // 只有当 meta 被修改时才更新 entryLogMetaMap，减少不必要的写操作
                     entryLogMetaMap.put(meta.getEntryLogId(), meta);
                 }
             } catch (EntryLogMetadataMapException e) {
-                // Ignore and continue because ledger will not be cleaned up
-                // from entry-logger in this pass and will be taken care in next
-                // schedule task
-                LOG.warn("Failed to remove ledger from entry-log metadata {}", entryLogId, e);
+                // 某些 ledger 删除过程中可能异常，跳过并继续处理下一个 entry log
+                // 未清理干净的 ledger 会在下次定时任务中再次尝试清理
+                LOG.warn("从 entry log 元数据中移除 ledger 失败，entryLogId: {}", entryLogId, e);
             }
+            // 累计当前 entry log 文件内还关联的 ledger 的剩余数据大小
             activeEntryLogSizeAcc.getAndAdd(meta.getRemainingSize());
+            // 累计所有 entry log 文件的总大小
             totalEntryLogSizeAcc.getAndAdd(meta.getTotalSize());
         });
+        // 将累计结果赋值为当前对象的统计属性
         this.activeEntryLogSize = activeEntryLogSizeAcc.get();
         this.totalEntryLogSize = totalEntryLogSizeAcc.get();
         this.numActiveEntryLogs = entryLogMetaMap.size();
     }
+
 
     private boolean removeIfLedgerNotExists(EntryLogMetadata meta) throws EntryLogMetadataMapException {
         MutableBoolean modified = new MutableBoolean(false);
@@ -616,22 +650,29 @@ public class GarbageCollectorThread implements Runnable {
     }
 
     /**
-     * Compact entry logs if necessary.
+     * 根据需要对 entry log 文件进行压缩 (Compaction)。
      *
      * <p>
-     * Compaction will be executed from low unused space to high unused space.
-     * Those entry log files whose remaining size percentage is higher than threshold
-     * would not be compacted.
+     * 压缩会从 low remaining size percentage 到 high remaining size percentage 顺序执行。
+     * 也就是说，优先 compact 剩余有效数据较少的 entry log 文件。
+     * 那些 remaining size percentage（即 entry log 文件中，仍然在使用的 ledger 数据的总大小，
+     * 占 entry log 文件总大小的比例）高于设置的 threshold 的 entry log 文件不会被 compact。
      * </p>
+     *
+     * @param threshold          剩余有效数据比例（remaining size percentage）阈值。只 compact 低于该阈值的 entry log。
+     * @param maxTimeMillis      本次压缩操作的最大运行时长，超时自动中止。
+     * @throws EntryLogMetadataMapException
      */
     @VisibleForTesting
     void doCompactEntryLogs(double threshold, long maxTimeMillis) throws EntryLogMetadataMapException {
         LOG.info("Do compaction to compact those files lower than {}", threshold);
 
-        final int numBuckets = ENTRY_LOG_USAGE_SEGMENT_COUNT;
-        int[] entryLogUsageBuckets = new int[numBuckets];
-        int[] compactedBuckets = new int[numBuckets];
+        // 按 usage（remaining size percentage，有效数据比例）分桶做统计
+        final int numBuckets = ENTRY_LOG_USAGE_SEGMENT_COUNT;  // 分段个数
+        int[] entryLogUsageBuckets = new int[numBuckets];       // 每个桶内 entry log 文件计数
+        int[] compactedBuckets = new int[numBuckets];           // 每个桶实际 compact 的 entry log 文件计数
 
+        // 每个桶存 entry log id 链表，这些 log 是可 compact 的
         ArrayList<LinkedList<Long>> compactableBuckets = new ArrayList<>(numBuckets);
         for (int i = 0; i < numBuckets; i++) {
             compactableBuckets.add(new LinkedList<>());
@@ -641,35 +682,47 @@ public class GarbageCollectorThread implements Runnable {
         MutableLong end = new MutableLong(start);
         MutableLong timeDiff = new MutableLong(0);
 
+        // 遍历所有 entry log 文件
         entryLogMetaMap.forEach((entryLogId, meta) -> {
+            // 获取 entry log 的 remaining size percentage
             double usage = meta.getUsage();
             if (conf.isUseTargetEntryLogSizeForGc() && usage < 1.0d) {
                 usage = (double) meta.getRemainingSize() / Math.max(meta.getTotalSize(), conf.getEntryLogSizeLimit());
             }
+            // 根据有效数据比例分段归入桶
             int bucketIndex = calculateUsageIndex(numBuckets, usage);
             entryLogUsageBuckets[bucketIndex]++;
 
+            // 计时，判断是否已经超时
             if (timeDiff.getValue() < maxTimeMillis) {
                 end.setValue(System.currentTimeMillis());
                 timeDiff.setValue(end.getValue() - start);
             }
+            // 满足下列其一则不需要 compact：
+            // 1. usage 高于阈值（数据太多了，不值得搬迁）；
+            // 2. 已经超时；
+            // 3. 当前 GC 任务已停止。
             if ((usage >= threshold
-                || (maxTimeMillis > 0 && timeDiff.getValue() >= maxTimeMillis)
-                || !running)) {
-                // We allow the usage limit calculation to continue so that we get an accurate
-                // report of where the usage was prior to running compaction.
+                    || (maxTimeMillis > 0 && timeDiff.getValue() >= maxTimeMillis)
+                    || !running)) {
                 return;
             }
-
+            // 加入待 compact 列表
             compactableBuckets.get(bucketIndex).add(meta.getEntryLogId());
         });
+
+        // 保留当前所有桶（分段）的统计信息，便于后续运维和监控
         currentEntryLogUsageBuckets = entryLogUsageBuckets;
         gcStats.setEntryLogUsageBuckets(currentEntryLogUsageBuckets);
+
         LOG.info(
                 "Compaction: entry log usage buckets before compaction [10% 20% 30% 40% 50% 60% 70% 80% 90% 100%] = {}",
                 entryLogUsageBuckets);
 
+        // 只对低于 threshold 的桶做压缩
         final int maxBucket = calculateUsageIndex(numBuckets, threshold);
+
+        // 统计即将要 compact 的 entry log 文件总数
         int totalEntryLogIds = 0;
         for (int currBucket = 0; currBucket <= maxBucket; currBucket++) {
             totalEntryLogIds += compactableBuckets.get(currBucket).size();
@@ -677,28 +730,32 @@ public class GarbageCollectorThread implements Runnable {
         long lastPrintTimestamp = 0;
         AtomicInteger processedEntryLogCnt = new AtomicInteger(0);
 
+        // 进入压缩主循环，从低到高逐桶处理
         stopCompaction:
         for (int currBucket = 0; currBucket <= maxBucket; currBucket++) {
             LinkedList<Long> entryLogIds = compactableBuckets.get(currBucket);
             while (!entryLogIds.isEmpty()) {
+                // 计时，判超时
                 if (timeDiff.getValue() < maxTimeMillis) {
                     end.setValue(System.currentTimeMillis());
                     timeDiff.setValue(end.getValue() - start);
                 }
 
+                // 已超时，或系统要求终止压缩，直接跳出
                 if ((maxTimeMillis > 0 && timeDiff.getValue() >= maxTimeMillis) || !running) {
-                    // We allow the usage limit calculation to continue so that we get an accurate
-                    // report of where the usage was prior to running compaction.
                     break stopCompaction;
                 }
 
                 final int bucketIndex = currBucket;
                 final long logId = entryLogIds.remove();
+
+                // 每分钟打印一次进度日志
                 if (System.currentTimeMillis() - lastPrintTimestamp >= MINUTE) {
                     lastPrintTimestamp = System.currentTimeMillis();
                     LOG.info("Compaction progress {} / {}, current compaction entryLogId: {}",
-                        processedEntryLogCnt.get(), totalEntryLogIds, logId);
+                            processedEntryLogCnt.get(), totalEntryLogIds, logId);
                 }
+                // 实际压缩对应的 entry log
                 entryLogMetaMap.forKey(logId, (entryLogId, meta) -> {
                     if (meta == null) {
                         if (LOG.isDebugEnabled()) {
@@ -712,14 +769,16 @@ public class GarbageCollectorThread implements Runnable {
                     }
 
                     long priorRemainingSize = meta.getRemainingSize();
-                    compactEntryLog(meta);
+                    compactEntryLog(meta); // 实际搬迁/compact逻辑
                     gcStats.getReclaimedSpaceViaCompaction().addCount(meta.getTotalSize() - priorRemainingSize);
+
                     compactedBuckets[bucketIndex]++;
                     processedEntryLogCnt.getAndIncrement();
                 });
             }
         }
 
+        // 打印调试日志，辅助定位调度、超时等原因
         if (LOG.isDebugEnabled()) {
             if (!running) {
                 LOG.debug("Compaction exited due to gc not running");
@@ -728,21 +787,30 @@ public class GarbageCollectorThread implements Runnable {
                 LOG.debug("Compaction ran for {}ms but was limited by {}ms", timeDiff, maxTimeMillis);
             }
         }
+        // 统计压缩比，便于监控聚合指标
         int totalEntryLogNum = Arrays.stream(entryLogUsageBuckets).sum();
         int compactedEntryLogNum = Arrays.stream(compactedBuckets).sum();
         this.entryLogCompactRatio = totalEntryLogNum == 0 ? 0 : (double) compactedEntryLogNum / totalEntryLogNum;
+
         LOG.info("Compaction: entry log usage buckets[10% 20% 30% 40% 50% 60% 70% 80% 90% 100%] = {}, compacted {}, "
                 + "compacted entry log ratio {}", entryLogUsageBuckets, compactedBuckets, entryLogCompactRatio);
     }
 
+
     /**
-     * Calculate the index for the batch based on the usage between 0 and 1.
+     * 根据 entry log 的 usage（remaining size percentage）计算应该归属于哪个桶（bucket）的索引。
+     * usage 范围在 0.0 到 1.0 之间，表示 entry log 文件中正在被 ledger 使用的数据比例（remaining size percentage）。
      *
-     * @param numBuckets Number of reporting buckets.
-     * @param usage 0.0 - 1.0 value representing the usage of the entry log.
-     * @return index based on the number of buckets The last bucket will have the 1.0 if added.
+     * 例如：如果 numBuckets = 10，则每个桶覆盖 10% 的 usage 区间，
+     * usage 在 0.0 ~ 0.099 映射到第0桶，0.10~0.199 映射到第1桶... 0.9~1.0 映射到第9桶。
+     *
+     * @param numBuckets 分桶（bucket）总数
+     * @param usage usage（remaining size percentage），值域为 0.0 - 1.0，表示 entry log 的有效数据比例
+     * @return 归属桶的索引（index），范围 0 ~ numBuckets-1。即使 usage=1.0，也属于最后一个桶。
      */
     int calculateUsageIndex(int numBuckets, double usage) {
+        // 例如，usage=0.57，numBuckets=10，则 index=Math.floor(0.57*10)=5，表示第5号桶
+        // 如果 usage=1.0，则 index=Math.floor(10)=10，但结果限制最大为9（即 numBuckets-1）
         return Math.min(
                 numBuckets - 1,
                 (int) Math.floor(usage * numBuckets));
@@ -796,83 +864,91 @@ public class GarbageCollectorThread implements Runnable {
     }
 
     /**
-     * Compact an entry log.
+     * 对单个 entry log 文件进行数据压缩（compaction）。
+     * 对象 entryLogMeta 表示该 entry log 的元数据，其中包含剩余有效数据比例（remaining size percentage）。
      *
-     * @param entryLogMeta
+     * 压缩过程将有效数据迁移到新的 entry log，以便清理掉无效数据，提升空间利用率。
+     *
+     * 实现机制：
+     * - 压缩期间打上 compacting 标志，防止过程中被 shutdown（比如实例关闭），否则可能出现 ClosedByInterruptException，
+     *   这可能导致索引文件和 entry logger 同时关闭甚至损坏。
+     * - 如果当前 log 已在压缩（compacting 为 true），则直接返回，避免重复压缩。
+     * - 操作结束后，及时清除 compacting 标志。
+     *
+     * @param entryLogMeta  需要被压缩的 entry log 元数据信息，包含剩余有效数据比例等属性
      */
     protected void compactEntryLog(EntryLogMetadata entryLogMeta) {
-        // Similar with Sync Thread
-        // try to mark compacting flag to make sure it would not be interrupted
-        // by shutdown during compaction. otherwise it will receive
-        // ClosedByInterruptException which may cause index file & entry logger
-        // closed and corrupted.
+        // 类似 Sync Thread 的处理
+        // 尝试将 compacting 标志设为 true，表示进入压缩期间，防止在压缩过程中被关停
+        // 否则 Shutdown 时收到 ClosedByInterruptException，可能导致索引或 entry logger 文件损坏
         if (!compacting.compareAndSet(false, true)) {
-            // set compacting flag failed, means compacting is true now
-            // indicates that compaction is in progress for this EntryLogId.
+            // 设置 compacting 标志失败，说明该 EntryLogId 的压缩已在进行，直接返回
             return;
         }
 
         try {
-            // Do the actual compaction
+            // 调用 compactor 执行实际的压缩逻辑：迁移剩余有效 ledger 数据
             compactor.compact(entryLogMeta);
         } catch (Exception e) {
             LOG.error("Failed to compact entry log {} due to unexpected error", entryLogMeta.getEntryLogId(), e);
         } finally {
-            // Mark compaction done
+            // 压缩完成，重置 compacting 标志
             compacting.set(false);
         }
     }
 
     /**
-     * Method to read in all of the entry logs (those that we haven't done so yet),
-     * and find the set of ledger ID's that make up each entry log file.
+     * 读取所有尚未处理的 entry log 文件，并分析每个 entry log 文件中包含的 ledger ID 集合。
      *
      * @throws EntryLogMetadataMapException
      */
     protected void extractMetaFromEntryLogs() throws EntryLogMetadataMapException {
+        // 遍历所有已经刷新（写入磁盘）的 entry log 文件的 ID
         for (long entryLogId : entryLogger.getFlushedLogIds()) {
-            // Comb the current entry log file if it has not already been extracted.
+            // 如果当前 entry log 文件的元数据已经被提取过则跳过，避免重复处理
             if (entryLogMetaMap.containsKey(entryLogId)) {
                 continue;
             }
 
-            // check whether log file exists or not
-            // if it doesn't exist, this log file might have been garbage collected.
+            // 检查 entry log 文件是否存在
+            // 若不存在，文件可能已被垃圾回收（GC）删除，直接跳过
             if (!entryLogger.logExists(entryLogId)) {
                 continue;
             }
 
-
             try {
-                // Read through the entry log file and extract the entry log meta
+                // 读取 entry log 文件并提取元数据信息（包括该文件中的 ledger ID 信息）
                 EntryLogMetadata entryLogMeta = entryLogger.getEntryLogMetadata(entryLogId, throttler);
-                LOG.info("Extracted entry log meta from entryLogId: {}, ledgers {}",
-                    entryLogId, entryLogMeta.getLedgersMap().keys());
+                LOG.info("已提取 entry log 元数据：entryLogId: {}, 含有的 ledgers: {}",
+                        entryLogId, entryLogMeta.getLedgersMap().keys());
+
+                // 更新entryLogMeta中的ledger信息，移除那些不再存在的ledger
                 removeIfLedgerNotExists(entryLogMeta);
                 if (entryLogMeta.isEmpty()) {
-                    // This means the entry log is not associated with any active
-                    // ledgers anymore.
-                    // We can remove this entry log file now.
-                    LOG.info("Deleting entryLogId {} as it has no active ledgers!", entryLogId);
+                    // entry log 文件未关联任何活动 ledger，说明所有 ledger 都已删除或失效
+                    // 可以安全删除该 entry log 文件以节省磁盘空间
+                    LOG.info("删除 entryLogId {} 因其已无活动 ledger!", entryLogId);
                     if (removeEntryLog(entryLogId)) {
+                        // 删除成功，统计被回收的空间
                         gcStats.getReclaimedSpaceViaDeletes().addCount(entryLogMeta.getTotalSize());
                     } else {
+                        // 删除失败，统计删除失败次数
                         gcStats.getReclaimFailedToDelete().inc();
                     }
                 } else {
+                    // entry log 仍有关联的活动 ledger，保存其元数据到缓存
                     entryLogMetaMap.put(entryLogId, entryLogMeta);
                 }
             } catch (IOException | RuntimeException e) {
-                LOG.warn("Premature exception when processing {} recovery will take care of the problem",
-                        entryLogId, e);
+                // 处理过程中异常（如 IO 错误、运行时异常），记录日志，剩余处理由恢复进程完成
+                LOG.warn("处理 {} 时产生异常，恢复流程将处理该问题", entryLogId, e);
             } catch (OutOfMemoryError oome) {
-                // somewhat similar to https://github.com/apache/bookkeeper/pull/3901
-                // entrylog file can be corrupted but instead having a negative entry size
-                // it ends up with very large value for the entry size causing OODME
-                LOG.warn("OutOfMemoryError when processing {} - skipping the entry log", entryLogId, oome);
+                // 处理 entry log 文件时遇到内存溢出（常因文件损坏导致 entry size 异常大），记录日志并跳过该文件
+                LOG.warn("处理 {} 时出现 OutOfMemoryError，跳过该 entry log", entryLogId, oome);
             }
         }
     }
+
 
     CompactableLedgerStorage getLedgerStorage() {
         return ledgerStorage;

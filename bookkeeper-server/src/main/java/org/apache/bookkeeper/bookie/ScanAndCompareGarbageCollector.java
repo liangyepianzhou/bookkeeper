@@ -111,109 +111,129 @@ public class ScanAndCompareGarbageCollector implements GarbageCollector {
         return activeLedgerCounter;
     }
 
+    /**
+     * 垃圾回收主流程：遍历本地和元数据中的Ledger，清理不需要的Ledger。
+     * @param garbageCleaner 执行具体清理操作的实现
+     */
     @Override
     public void gc(GarbageCleaner garbageCleaner) {
+        // 首先检查 ledgerManager 是否存在，
+        // 如果为 null 说明 Bookie 尚未连接元数据存储，此时跳过 GC，避免异常
         if (null == ledgerManager) {
-            // if ledger manager is null, the bookie is not started to connect to metadata store.
-            // so skip garbage collection
+            // 若 ledger manager 为 null，说明 bookie 未启动或未连接 metadata store，
+            // 此时跳过垃圾回收
             return;
         }
 
         try {
-            // Get a set of all ledgers on the bookie
-            NavigableSet<Long> bkActiveLedgers = Sets.newTreeSet(ledgerStorage.getActiveLedgersInRange(0,
-                    Long.MAX_VALUE));
-            this.activeLedgerCounter = bkActiveLedgers.size();
+            // 获取本地 bookie 上所有活跃（active）的 ledger（范围：从0到无穷大）
+            NavigableSet<Long> bkActiveLedgers = Sets.newTreeSet(ledgerStorage.getActiveLedgersInRange(0, Long.MAX_VALUE));
+            this.activeLedgerCounter = bkActiveLedgers.size(); // 活跃 ledger 数量统计
 
+            // 判断是否需要清理超副本账本：enableGcOverReplicatedLedger 打开且距离上次超副本 GC 已超过配置时间
             long curTime = System.currentTimeMillis();
-            boolean checkOverreplicatedLedgers = (enableGcOverReplicatedLedger && curTime
-                    - lastOverReplicatedLedgerGcTimeMillis > gcOverReplicatedLedgerIntervalMillis);
-            if (checkOverreplicatedLedgers) {
+            boolean checkOverReplicatedLedgers = (enableGcOverReplicatedLedger &&
+                    curTime - lastOverReplicatedLedgerGcTimeMillis > gcOverReplicatedLedgerIntervalMillis);
+
+            if (checkOverReplicatedLedgers) {
                 LOG.info("Start removing over-replicated ledgers. activeLedgerCounter={}", activeLedgerCounter);
 
-                // remove all the overreplicated ledgers from the local bookie
+                // 移除本地多余副本的 ledger
                 Set<Long> overReplicatedLedgers = removeOverReplicatedledgers(bkActiveLedgers, garbageCleaner);
+
                 if (overReplicatedLedgers.isEmpty()) {
                     LOG.info("No over-replicated ledgers found.");
                 } else {
                     LOG.info("Removed over-replicated ledgers: {}", overReplicatedLedgers);
                 }
+
+                // 刷新上次超副本 GC 操作时间
                 lastOverReplicatedLedgerGcTimeMillis = System.currentTimeMillis();
             }
 
-            // Iterate over all the ledger on the metadata store
-            long zkOpTimeoutMs = this.conf.getZkTimeout() * 2;
-            LedgerRangeIterator ledgerRangeIterator = ledgerManager
-                    .getLedgerRanges(zkOpTimeoutMs);
-            Set<Long> ledgersInMetadata = null;
+            // ========== 开始遍历元数据存储上的所有 Ledger ==========
+            long zkOpTimeoutMs = this.conf.getZkTimeout() * 2; // 元数据超时为默认两倍
+            LedgerRangeIterator ledgerRangeIterator = ledgerManager.getLedgerRanges(zkOpTimeoutMs);
+
+            Set<Long> ledgersInMetadata = null; // 每次遍历一段区间的 ledger
             long start;
             long end = -1;
             boolean done = false;
             AtomicBoolean isBookieInEnsembles = new AtomicBoolean(false);
             Versioned<LedgerMetadata> metadata = null;
+
             while (!done) {
+                // 计算本轮区间起点
                 start = end + 1;
+
+                // 判断是否还有下一个 LedgerRange
                 if (ledgerRangeIterator.hasNext()) {
                     LedgerRange lRange = ledgerRangeIterator.next();
-                    ledgersInMetadata = lRange.getLedgers();
-                    end = lRange.end();
+                    ledgersInMetadata = lRange.getLedgers(); // 该区间所有 ledger（元数据中的）
+                    end = lRange.end(); // 区间终止 ledgerId
                 } else {
-                    ledgersInMetadata = new TreeSet<>();
-                    end = Long.MAX_VALUE;
+                    // 没有下一个区间了
+                    ledgersInMetadata = new TreeSet<>(); // 空集合
+                    end = Long.MAX_VALUE; // 终止全局遍历
                     done = true;
                 }
 
+                // 获取本地 bookie 上当前区间的活跃 Ledger
                 Iterable<Long> subBkActiveLedgers = bkActiveLedgers.subSet(start, true, end, true);
 
                 if (LOG.isDebugEnabled()) {
                     LOG.debug("Active in metadata {}, Active in bookie {}", ledgersInMetadata, subBkActiveLedgers);
                 }
+
                 for (Long bkLid : subBkActiveLedgers) {
+                    // 若本地 ledger 不在元数据 ledger 列表中
                     if (!ledgersInMetadata.contains(bkLid)) {
+                        // 如果开启元数据校验，则还要进一步比对
                         if (verifyMetadataOnGc) {
                             isBookieInEnsembles.set(false);
                             metadata = null;
                             int rc = BKException.Code.OK;
                             try {
-                                metadata = result(ledgerManager.readLedgerMetadata(bkLid), zkOpTimeoutMs,
-                                        TimeUnit.MILLISECONDS);
+                                // 从元数据存储读取账本元数据
+                                metadata = result(ledgerManager.readLedgerMetadata(bkLid), zkOpTimeoutMs, TimeUnit.MILLISECONDS);
                             } catch (BKException | TimeoutException e) {
                                 if (e instanceof BKException) {
                                     rc = ((BKException) e).getCode();
                                 } else {
-                                    LOG.warn("Time-out while fetching metadata for Ledger {} : {}.", bkLid,
-                                            e.getMessage());
-
+                                    // 超时时输出警告，跳过此 ledger
+                                    LOG.warn("Time-out while fetching metadata for Ledger {} : {}.", bkLid, e.getMessage());
                                     continue;
                                 }
                             }
-                            // check bookie should be part of ensembles in one
-                            // of the segment else ledger should be deleted from
-                            // local storage
+
+                            // 检查本地 bookie 是否在任意 ledger segment 的 ensemble 列表中
+                            // 如果本地仍在 ensemble 中，则跳过清理
                             if (metadata != null && metadata.getValue() != null) {
                                 metadata.getValue().getAllEnsembles().forEach((entryId, ensembles) -> {
                                     if (ensembles != null && ensembles.contains(selfBookieAddress)) {
-                                        isBookieInEnsembles.set(true);
+                                        isBookieInEnsembles.set(true); // 本节点还在该 ledger 的副本列表中
                                     }
                                 });
                                 if (isBookieInEnsembles.get()) {
-                                    continue;
+                                    continue; // 本节点还被副本引用，不能清理
                                 }
+                                // 如果元数据异常，但不是“账本不存在”，则也跳过
                             } else if (rc != BKException.Code.NoSuchLedgerExistsOnMetadataServerException) {
-                                LOG.warn("Ledger {} Missing in metadata list, but ledgerManager returned rc: {}.",
-                                        bkLid, rc);
+                                LOG.warn("Ledger {} Missing in metadata list, but ledgerManager returned rc: {}.", bkLid, rc);
                                 continue;
                             }
                         }
+                        // 确认本地 ledger 已无法从元数据找到且没有副本关系，可以清理
                         garbageCleaner.clean(bkLid);
                     }
                 }
             }
         } catch (Throwable t) {
-            // ignore exception, collecting garbage next time
+            // 捕获所有异常（包含运行期异常），输出日志，下次 GC 时重试
             LOG.warn("Exception when iterating over the metadata", t);
         }
     }
+
 
     private Set<Long> removeOverReplicatedledgers(Set<Long> bkActiveledgers, final GarbageCleaner garbageCleaner)
             throws Exception {
