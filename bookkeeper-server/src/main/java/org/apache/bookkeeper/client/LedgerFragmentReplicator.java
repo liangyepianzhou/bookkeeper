@@ -209,55 +209,80 @@ public class LedgerFragmentReplicator {
     }
 
     /**
-     * This method replicate a ledger fragment which is a contiguous portion of
-     * a ledger that was stored in an ensemble that included the failed bookie.
-     * It will Splits the fragment into multiple sub fragments by keeping the
-     * max entries up to the configured value of rereplicationEntryBatchSize and
-     * then it re-replicates that batched entry fragments one by one. After
-     * re-replication of all batched entry fragments, it will update the
-     * ensemble info with new Bookie once
+     * 该方法用于复制 ledger 片段（LedgerFragment），该片段是存储在包含故障 Bookie 的副本组（ensemble）中的一段连续数据。
+     * 会将该片段按照 rereplicationEntryBatchSize（批处理条目数）配置拆分为多个子片段，
+     * 然后依次逐个重复制这些批次片段。所有批次片段重复制完成后，会用新的 Bookie 更新副本组（ensemble）信息。
      *
      * @param lh
-     *            LedgerHandle for the ledger
+     *            LedgerHandle，账本句柄
      * @param lf
-     *            LedgerFragment to replicate
+     *            LedgerFragment，需要复制的账本片段
      * @param ledgerFragmentMcb
-     *            MultiCallback to invoke once we've recovered the current
-     *            ledger fragment.
+     *            AsyncCallback.VoidCallback，全部片段复制完成后的回调
      * @param targetBookieAddresses
-     *            New bookies we want to use to recover and replicate the ledger
-     *            entries that were stored on the failed bookie.
+     *            Set<BookieId>，用于替换的目标 Bookie 节点集合
+     * @param onReadEntryFailureCallback
+     *            读取 entry 失败时的回调
      */
-    void replicate(final LedgerHandle lh, final LedgerFragment lf,
-            final AsyncCallback.VoidCallback ledgerFragmentMcb,
-            final Set<BookieId> targetBookieAddresses,
-            final BiConsumer<Long, Long> onReadEntryFailureCallback)
-            throws InterruptedException {
-        Set<LedgerFragment> partitionedFragments = splitIntoSubFragments(lh, lf,
-                bkc.getConf().getRereplicationEntryBatchSize());
+    void replicate(
+            final LedgerHandle lh,                     // 账本句柄
+            final LedgerFragment lf,                   // 需要复制的账本片段
+            final AsyncCallback.VoidCallback ledgerFragmentMcb, // 全部片段复制完成回调
+            final Set<BookieId> targetBookieAddresses,          // 替换目标 Bookie 集合
+            final BiConsumer<Long, Long> onReadEntryFailureCallback // 读取 entry 失败的回调
+    ) throws InterruptedException {
+        // 按配置批大小把片段拆分为多个子片段
+        Set<LedgerFragment> partitionedFragments = splitIntoSubFragments(
+                lh,
+                lf,
+                bkc.getConf().getRereplicationEntryBatchSize() // 批处理重复制条目数配置
+        );
         LOG.info("Replicating fragment {} in {} sub fragments.",
-                lf, partitionedFragments.size());
-        replicateNextBatch(lh, partitionedFragments.iterator(),
-                ledgerFragmentMcb, targetBookieAddresses, onReadEntryFailureCallback);
+                lf, partitionedFragments.size()); // 日志：当前片段拆分为多少子片段
+
+        // 按批次逐个复制子片段（递归方式实现）
+        replicateNextBatch(
+                lh,
+                partitionedFragments.iterator(),      // 所有子片段的 iterator
+                ledgerFragmentMcb,                    // 最终回调
+                targetBookieAddresses,                // 目标 Bookie
+                onReadEntryFailureCallback            // 读取失败回调
+        );
     }
 
     /**
-     * Replicate the batched entry fragments one after other.
+     * 依次复制批处理 entry 子片段（Batched entry fragments）。
+     *
+     * @param lh
+     *            LedgerHandle，账本句柄
+     * @param fragments
+     *            Iterator<LedgerFragment>，待复制的子片段迭代器
+     * @param ledgerFragmentMcb
+     *            全部完成时的回调
+     * @param targetBookieAddresses
+     *            目标 Bookie 集合
+     * @param onReadEntryFailureCallback
+     *            读取 entry 失败的回调
      */
-    private void replicateNextBatch(final LedgerHandle lh,
-            final Iterator<LedgerFragment> fragments,
-            final AsyncCallback.VoidCallback ledgerFragmentMcb,
-            final Set<BookieId> targetBookieAddresses,
-            final BiConsumer<Long, Long> onReadEntryFailureCallback) {
+    private void replicateNextBatch(
+            final LedgerHandle lh,                        // 账本句柄
+            final Iterator<LedgerFragment> fragments,     // 子片段迭代器
+            final AsyncCallback.VoidCallback ledgerFragmentMcb, // 片段复制总回调
+            final Set<BookieId> targetBookieAddresses,    // 目标 bookie 集合
+            final BiConsumer<Long, Long> onReadEntryFailureCallback // 读取 entry 失败回调
+    ) {
         if (fragments.hasNext()) {
             try {
-                replicateFragmentInternal(lh, fragments.next(),
-                        new AsyncCallback.VoidCallback() {
+                // 递归方式复制当前子片段
+                replicateFragmentInternal(
+                        lh,
+                        fragments.next(),                     // 当前子片段
+                        new AsyncCallback.VoidCallback() {    // 当前片段复制完成回调
                             @Override
                             public void processResult(int rc, String v, Object ctx) {
+                                // 复制失败，直接调用总回调（结束流程），否则递归调用复制下一个子片段
                                 if (rc != BKException.Code.OK) {
-                                    ledgerFragmentMcb.processResult(rc, null,
-                                            null);
+                                    ledgerFragmentMcb.processResult(rc, null, null);
                                 } else {
                                     replicateNextBatch(lh, fragments,
                                             ledgerFragmentMcb,
@@ -265,17 +290,22 @@ public class LedgerFragmentReplicator {
                                             onReadEntryFailureCallback);
                                 }
                             }
-
-                        }, targetBookieAddresses, onReadEntryFailureCallback);
+                        },
+                        targetBookieAddresses,           // 目标 Bookie
+                        onReadEntryFailureCallback       // 读取 entry 失败回调
+                );
             } catch (InterruptedException e) {
+                // 线程中断，通知回调异常
                 ledgerFragmentMcb.processResult(
                         BKException.Code.InterruptedException, null, null);
-                Thread.currentThread().interrupt();
+                Thread.currentThread().interrupt();  // 设置中断标志
             }
         } else {
+            // 所有子片段都已经复制完，回调成功
             ledgerFragmentMcb.processResult(BKException.Code.OK, null, null);
         }
     }
+
 
     /**
      * Split the full fragment into batched entry fragments by keeping

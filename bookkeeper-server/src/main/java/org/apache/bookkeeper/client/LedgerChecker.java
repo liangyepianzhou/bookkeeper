@@ -186,79 +186,90 @@ public class LedgerChecker {
     }
 
     /**
-     * Verify a ledger fragment to collect bad bookies.
+     * 校验指定账本片段（LedgerFragment），收集其中存在问题的 bookie。
+     * 对片段中的每一个副本（bookie）单独并发检测，最终回调返回结果。
      *
-     * @param fragment
-     *          fragment to verify
-     * @param cb
-     *          callback
-     * @throws InvalidFragmentException
+     * @param fragment      需要校验的账本片段
+     * @param cb            校验完成后的回调（GenericCallback<LedgerFragment>），用于返回结果
+     * @param percentageOfLedgerFragmentToBeVerified 校验采样比例（提升性能，减少全量校验开销）
+     * @throws InvalidFragmentException 片段结构异常/无效时抛出
+     * @throws BKException              BookKeeper体系相关异常
+     * @throws InterruptedException     线程中断异常
      */
     private void verifyLedgerFragment(LedgerFragment fragment,
                                       GenericCallback<LedgerFragment> cb,
                                       Long percentageOfLedgerFragmentToBeVerified)
             throws InvalidFragmentException, BKException, InterruptedException {
+        // 获取待校验的 bookie 副本索引集合（即该片段的分布副本）
         Set<Integer> bookiesToCheck = fragment.getBookiesIndexes();
         if (bookiesToCheck.isEmpty()) {
+            // 如果没有副本，立即返回成功
             cb.operationComplete(BKException.Code.OK, fragment);
             return;
         }
 
+        // 统计需校验 bookie 总数，用于异步合并结果
         AtomicInteger numBookies = new AtomicInteger(bookiesToCheck.size());
+        // 收集发现的坏 bookie（副本索引 -> 错误码）
         Map<Integer, Integer> badBookies = new HashMap<Integer, Integer>();
+
+        // 并发处理每一个 bookie 副本的片段校验
         for (Integer bookieIndex : bookiesToCheck) {
+            // 对每个副本都创建一个异步回调，收集单副本检验结果，合并到 badBookies
             LedgerFragmentCallback lfCb = new LedgerFragmentCallback(
                     fragment, bookieIndex, cb, badBookies, numBookies);
+            // 实际发起对每个副本的详细校验（比如读 entry 检查数据完整性等）
             verifyLedgerFragment(fragment, bookieIndex, lfCb, percentageOfLedgerFragmentToBeVerified);
         }
     }
 
     /**
-     * Verify a bookie inside a ledger fragment.
+     * 校验 ledger fragment 在指定 bookie 上的内容完整性。
+     * 支持自动采样、多副本分支、坏副本快速跳过等。
      *
-     * @param fragment
-     *          ledger fragment
-     * @param bookieIndex
-     *          bookie index in the fragment
-     * @param cb
-     *          callback
-     * @throws InvalidFragmentException
+     * @param fragment  当前需要检查的账本片段
+     * @param bookieIndex  当前片段bookie副本索引
+     * @param cb  回调，用于返回校验结果或异常
+     * @param percentageOfLedgerFragmentToBeVerified 采样校验百分比
+     * @throws InvalidFragmentException  片段数据异常
+     * @throws InterruptedException      线程中断异常
      */
     private void verifyLedgerFragment(LedgerFragment fragment,
                                       int bookieIndex,
                                       GenericCallback<LedgerFragment> cb,
                                       long percentageOfLedgerFragmentToBeVerified)
             throws InvalidFragmentException, InterruptedException {
-        long firstStored = fragment.getFirstStoredEntryId(bookieIndex);
-        long lastStored = fragment.getLastStoredEntryId(bookieIndex);
+        long firstStored = fragment.getFirstStoredEntryId(bookieIndex); // 该 bookie 上存储的首条 entryId
+        long lastStored = fragment.getLastStoredEntryId(bookieIndex);   // 该 bookie 上存储的末条 entryId
 
-        BookieId bookie = fragment.getAddress(bookieIndex);
+        BookieId bookie = fragment.getAddress(bookieIndex); // 当前副本 bookie 的物理地址
         if (null == bookie) {
             throw new InvalidFragmentException();
         }
 
+        // fragment不在该bookie上：首尾都为无效ID
         if (firstStored == LedgerHandle.INVALID_ENTRY_ID) {
-            // this fragment is not on this bookie
             if (lastStored != LedgerHandle.INVALID_ENTRY_ID) {
                 throw new InvalidFragmentException();
             }
-
+            // 该 bookie 注册为不可用，直接标记跳过
             if (bookieWatcher.isBookieUnavailable(fragment.getAddress(bookieIndex))) {
-                // fragment is on this bookie, but already know it's unavailable, so skip the call
                 cb.operationComplete(BKException.Code.BookieHandleNotAvailableException, fragment);
             } else {
+                // 副本正常，但没落在该 bookie 上，认为 OK
                 cb.operationComplete(BKException.Code.OK, fragment);
             }
+            // 副本应该在该 bookie 上，但该节点不可用，直接返回坏副本
         } else if (bookieWatcher.isBookieUnavailable(fragment.getAddress(bookieIndex))) {
-            // fragment is on this bookie, but already know it's unavailable, so skip the call
             cb.operationComplete(BKException.Code.BookieHandleNotAvailableException, fragment);
+            // 该 fragment 只包含一个 entry，只需校验这一个 entry 即可
         } else if (firstStored == lastStored) {
-            acquirePermit();
-            ReadManyEntriesCallback manycb = new ReadManyEntriesCallback(1,
-                    fragment, cb);
+            acquirePermit(); // 并发控制
+            ReadManyEntriesCallback manycb = new ReadManyEntriesCallback(1, fragment, cb);
             bookieClient.readEntry(bookie, fragment.getLedgerId(), firstStored,
-                                   manycb, bookie, BookieProtocol.FLAG_NONE);
+                    manycb, bookie, BookieProtocol.FLAG_NONE);
         } else {
+            // 多 entry，如 lastStored < firstStored，参数不正确
             if (lastStored <= firstStored) {
                 cb.operationComplete(Code.IncorrectParameterException, null);
                 return;
@@ -266,28 +277,31 @@ public class LedgerChecker {
 
             long lengthOfLedgerFragment = lastStored - firstStored + 1;
 
+            // 采样校验条数，百分比到实际整数条数
             int numberOfEntriesToBeVerified =
-                (int) (lengthOfLedgerFragment * (percentageOfLedgerFragmentToBeVerified / 100.0));
+                    (int) (lengthOfLedgerFragment * (percentageOfLedgerFragmentToBeVerified / 100.0));
 
             TreeSet<Long> entriesToBeVerified = new TreeSet<Long>();
 
             if (numberOfEntriesToBeVerified < lengthOfLedgerFragment) {
-                // Evenly pick random entries over the length of the fragment
+                // 采样校验，只验证头、尾及分布采样点，覆盖面均匀分散
                 if (numberOfEntriesToBeVerified > 0) {
                     int lengthOfBucket = (int) (lengthOfLedgerFragment / numberOfEntriesToBeVerified);
                     for (long index = firstStored;
                          index < (lastStored - lengthOfBucket - 1);
                          index += lengthOfBucket) {
+                        // 每个区间取一个随机 entry 作为样本点
                         long potentialEntryId = ThreadLocalRandom.current().nextInt((lengthOfBucket)) + index;
                         if (fragment.isStoredEntryId(potentialEntryId, bookieIndex)) {
                             entriesToBeVerified.add(potentialEntryId);
                         }
                     }
                 }
+                // 校验片段的头和尾，保证边界数据一直被验证
                 entriesToBeVerified.add(firstStored);
                 entriesToBeVerified.add(lastStored);
             } else {
-                // Verify the entire fragment
+                // fragment较短，直接校验所有 entry
                 while (firstStored <= lastStored) {
                     if (fragment.isStoredEntryId(firstStored, bookieIndex)) {
                         entriesToBeVerified.add(firstStored);
@@ -295,8 +309,8 @@ public class LedgerChecker {
                     firstStored++;
                 }
             }
-            ReadManyEntriesCallback manycb = new ReadManyEntriesCallback(entriesToBeVerified.size(),
-                    fragment, cb);
+            // 发起多个并发异步读，使用 ReadManyEntriesCallback 合并结果
+            ReadManyEntriesCallback manycb = new ReadManyEntriesCallback(entriesToBeVerified.size(), fragment, cb);
             for (Long entryID: entriesToBeVerified) {
                 acquirePermit();
                 bookieClient.readEntry(bookie, fragment.getLedgerId(), entryID, manycb, bookie,
@@ -304,6 +318,7 @@ public class LedgerChecker {
             }
         }
     }
+
 
     /**
      * Callback for checking whether an entry exists or not.
@@ -377,45 +392,52 @@ public class LedgerChecker {
         checkLedger(lh, cb, 0L);
     }
 
+    /**
+     * 检查指定账本的所有分片（LedgerFragment），根据 ensemble 切分并回调结果。
+     * 最后一个分片（segment）的校验逻辑特殊，需区分账本关闭/未关闭及是否有写入数据。
+     *
+     * @param lh 账本句柄（LedgerHandle）
+     * @param cb 校验完后的回调（GenericCallback<Set<LedgerFragment>>）
+     * @param percentageOfLedgerFragmentToBeVerified 本次校验的分片采样百分比
+     */
     public void checkLedger(final LedgerHandle lh,
                             final GenericCallback<Set<LedgerFragment>> cb,
                             long percentageOfLedgerFragmentToBeVerified) {
-        // build a set of all fragment replicas
+        // 保存所有分片（片段），按 ensemble（每次账本副本分布变更）切分
         final Set<LedgerFragment> fragments = new LinkedHashSet<>();
 
         Long curEntryId = null;
         List<BookieId> curEnsemble = null;
+        // 遍历账本的每个 ensemble（副本布局变化起始 entryId，与bookie列表）
         for (Map.Entry<Long, ? extends List<BookieId>> e : lh
                 .getLedgerMetadata().getAllEnsembles().entrySet()) {
             if (curEntryId != null) {
+                // 获得 ensemble 分片中的所有书写副本索引
                 Set<Integer> bookieIndexes = new HashSet<Integer>();
                 for (int i = 0; i < curEnsemble.size(); i++) {
                     bookieIndexes.add(i);
                 }
+                // 按当前 fragment 起止 entryId（上一ensemble起点，当前ensemble前一entry），和副本书写分布， 创建LedgerFragment
                 fragments.add(new LedgerFragment(lh, curEntryId,
                         e.getKey() - 1, bookieIndexes));
             }
+            // 更新当前ensemble起点和副本信息
             curEntryId = e.getKey();
             curEnsemble = e.getValue();
         }
 
-        /* Checking the last segment of the ledger can be complicated in some cases.
-         * In the case that the ledger is closed, we can just check the fragments of
-         * the segment as normal even if no data has ever been written to.
-         * In the case that the ledger is open, but enough entries have been written,
-         * for lastAddConfirmed to be set above the start entry of the segment, we
-         * can also check as normal.
-         * However, if ledger is open, sometimes lastAddConfirmed cannot be trusted,
-         * such as when it's lower than the first entry id, or not set at all,
-         * we cannot be sure if there has been data written to the segment.
-         * For this reason, we have to send a read request
-         * to the bookies which should have the first entry. If they respond with
-         * NoSuchEntry we can assume it was never written. If they respond with anything
-         * else, we must assume the entry has been written, so we run the check.
+        /*
+         * 对账本最后一个分片（segment）进行特殊处理。
+         * - 如果账本已关闭，典型场景，可直接校验最后分片（即便没写过数据）
+         * - 如果账本未关闭，且 lastAddConfirmed > 最后分片的起始 entryId，可直接校验
+         * - 如果账本未关闭且 lastAddConfirmed 小于等于最后分片起始 entryId，可能没有数据，这时必须实际请求所有 bookie 读 entry
+         *   - 若 bookie 返回 NoSuchEntry，说明没有数据写入，可跳过
+         *   - 若 bookie 返回数据，说明至少有写入，应正常校验该分片
          */
         if (curEntryId != null) {
             long lastEntry = lh.getLastAddConfirmed();
 
+            // 未关闭且没有写够 entry，则用分片起点补齐（特殊场景）
             if (!lh.isClosed() && lastEntry < curEntryId) {
                 lastEntry = curEntryId;
             }
@@ -427,42 +449,50 @@ public class LedgerChecker {
             final LedgerFragment lastLedgerFragment = new LedgerFragment(lh, curEntryId,
                     lastEntry, bookieIndexes);
 
-            // Check for the case that no last confirmed entry has been set
+            // 如果分片只有一个 entry，且 lastConfirmedEntry == 起始 entry，需要特殊检查（确定有无数据写入）
             if (curEntryId == lastEntry) {
                 final long entryToRead = curEntryId;
 
+                // 用 CompletableFuture 做异步流程衔接
                 final CompletableFuture<Void> future = new CompletableFuture<>();
                 future.whenCompleteAsync((re, ex) -> {
+                    // 校验分片集合（回调），用于实际逻辑处理
                     checkFragments(fragments, cb, percentageOfLedgerFragmentToBeVerified);
                 });
 
-                final EntryExistsCallback eecb = new EntryExistsCallback(lh.getLedgerMetadata().getWriteQuorumSize(),
-                                              new GenericCallback<Boolean>() {
-                                                  @Override
-                                                  public void operationComplete(int rc, Boolean result) {
-                                                      if (result) {
-                                                          fragments.add(lastLedgerFragment);
-                                                      }
-                                                      future.complete(null);
-                                                  }
-                                              });
+                // EntryExistsCallback 会收集多个副本的读结果，只要有一个返回说明该 entry 已经写过，则该分片必须加到校验集合中
+                final EntryExistsCallback eecb = new EntryExistsCallback(
+                        lh.getLedgerMetadata().getWriteQuorumSize(),
+                        new GenericCallback<Boolean>() {
+                            @Override
+                            public void operationComplete(int rc, Boolean result) {
+                                if (result) {
+                                    fragments.add(lastLedgerFragment);
+                                }
+                                future.complete(null); // 都收集完后，回调主流程
+                            }
+                        });
 
                 DistributionSchedule ds = lh.getDistributionSchedule();
                 for (int i = 0; i < ds.getWriteQuorumSize(); i++) {
                     try {
-                        acquirePermit();
+                        acquirePermit(); // 控制并发数
                         BookieId addr = curEnsemble.get(ds.getWriteSetBookieIndex(entryToRead, i));
+                        // 向每个副本请求读 entry，异步收集读结果
                         bookieClient.readEntry(addr, lh.getId(), entryToRead,
                                 eecb, null, BookieProtocol.FLAG_NONE);
                     } catch (InterruptedException e) {
-                        LOG.error("InterruptedException when checking entry : {}", entryToRead, e);
+                        LOG.error("检查 entry {} 时线程被中断", entryToRead, e);
                     }
                 }
                 return;
             } else {
+                // 有数据可直接校验
                 fragments.add(lastLedgerFragment);
             }
         }
+
+        // 校验所有分片（进行采样、标记等实际日志处理）
         checkFragments(fragments, cb, percentageOfLedgerFragmentToBeVerified);
     }
 

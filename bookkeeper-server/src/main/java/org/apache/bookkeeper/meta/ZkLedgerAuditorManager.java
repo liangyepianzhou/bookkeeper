@@ -91,59 +91,69 @@ public class ZkLedgerAuditorManager implements LedgerAuditorManager {
     @Override
     public void tryToBecomeAuditor(String bookieId, Consumer<AuditorEvent> listener)
             throws IOException, InterruptedException {
+        // 设置事件监听器，用于通知外部处理审计相关事件
         this.listener = listener;
+        // 创建选举路径（ZooKeeper临时节点的父节点），用于存储投票信息
         createElectorPath();
 
         try {
+            // 主循环，在没有关闭的情况下不断尝试当选为Auditor
             while (!isClosed) {
+                // 创建本节点的投票（临时顺序znode）
                 createMyVote(bookieId);
 
+                // 获取所有参与选举的子节点列表（按照zk顺序编号）
                 List<String> children = zkc.getChildren(getVotePath(""), false);
                 if (0 >= children.size()) {
+                    // 至少需要一个bookie参与选举，否则抛异常
                     throw new IllegalArgumentException(
-                            "At least one bookie server should present to elect the Auditor!");
+                            "必须至少有一个 bookie server 才能选举Auditor！");
                 }
 
-                // sorting in ascending order of sequential number
+                // 按照节点序号升序排序
                 Collections.sort(children, new ElectionComparator());
+                // 获取自己节点的名称（去除路径，只要节点名，如V_0000000001）
                 String voteNode = StringUtils.substringAfterLast(myVote, PATH_SEPARATOR);
 
+                // 排在最前的节点为Auditor（编号最小）
                 if (children.get(AUDITOR_INDEX).equals(voteNode)) {
-                    // We have been elected as the auditor
-                    // update the auditor bookie id in the election path. This is
-                    // done for debugging purpose
+                    // 已经被选举为Auditor
+                    // 在选举路径记录Auditor的bookieId（仅用于调试）
                     AuditorVoteFormat.Builder builder = AuditorVoteFormat.newBuilder()
                             .setBookieId(bookieId);
 
                     zkc.setData(getVotePath(""),
                             builder.build().toString().getBytes(UTF_8), -1);
                     return;
-                 } else {
-                    // If not an auditor, will be watching to my predecessor and
-                    // looking the previous node deletion.
+                } else {
+                    // 如果没当选为Auditor，监听自己的前一个节点（前驱节点）
                     int myIndex = children.indexOf(voteNode);
                     if (myIndex < 0) {
-                        throw new IllegalArgumentException("My vote has disappeared");
+                        // 如果本节点被删除（极端情况），报错
+                        throw new IllegalArgumentException("本节点投票已消失");
                     }
 
                     int prevNodeIndex = myIndex - 1;
 
+                    // 用CountDownLatch等待事件（前一个节点被删除）
                     CountDownLatch latch = new CountDownLatch(1);
 
+                    // 检查前驱节点是否存在，并注册监听
                     if (null == zkc.exists(getVotePath(PATH_SEPARATOR)
                             + children.get(prevNodeIndex), event -> latch.countDown())) {
-                        // While adding, the previous znode doesn't exists.
-                        // Again going to election.
+                        // 如果前驱节点不存在，重试选举流程
                         continue;
                     }
 
-                    // Wait for the previous auditor in line to be deleted
+                    // 等待前驱节点被删除（即有bookie下线），再次尝试选举
                     latch.await();
                 }
 
+                // 记录选举尝试次数
                 electionAttempts.inc();
             }
         } catch (KeeperException e) {
+            // ZooKeeper抛出的异常包装为IO异常
             throw new IOException(e);
         }
     }
@@ -190,18 +200,34 @@ public class ZkLedgerAuditorManager implements LedgerAuditorManager {
         }
     }
 
+    /**
+     * 在 ZooKeeper 上为当前 bookie 创建投票节点（临时顺序节点）。
+     * 该节点用于参与 Auditor 选举，节点内容记录当前 bookie 的 ID。
+     *
+     * @param bookieId 当前 bookie 的唯一标识符
+     * @throws IOException ZooKeeper 操作异常
+     * @throws InterruptedException 线程中断异常
+     */
     private void createMyVote(String bookieId) throws IOException, InterruptedException {
+        // 获取配置文件中的 ACL 权限设置
         List<ACL> zkAcls = ZkUtils.getACLs(conf);
+
+        // 构建节点数据（包含 bookieId），用于标识该投票节点归属哪个 bookie
         AuditorVoteFormat.Builder builder = AuditorVoteFormat.newBuilder()
                 .setBookieId(bookieId);
 
         try {
+            // 首次投票（myVote 为 null），或者之前节点已经不存在（被删除、长时间未连接等），需要重新创建投票节点
             if (null == myVote || null == zkc.exists(myVote, false)) {
+                // 在选举路径下创建临时顺序节点（EPHEMERAL_SEQUENTIAL），节点名称前缀为 VOTE_PREFIX
+                // 节点内容为当前 bookieId，权限为zkAcls
                 myVote = zkc.create(getVotePath(PATH_SEPARATOR + VOTE_PREFIX),
                         builder.build().toString().getBytes(UTF_8), zkAcls,
                         CreateMode.EPHEMERAL_SEQUENTIAL);
+                // 保存节点路径到 myVote，后续用于选举及监听
             }
         } catch (KeeperException e) {
+            // 若 ZooKeeper 操作异常，抛出 IO 异常（如连接丢失、权限不足等）
             throw new IOException(e);
         }
     }

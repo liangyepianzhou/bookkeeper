@@ -512,74 +512,100 @@ public class ZkLedgerUnderreplicationManager implements LedgerUnderreplicationMa
         };
     }
 
+    /**
+     * 从指定的 ZooKeeper 层级 path 下递归查找需要重新复制（rereplicate）的 ledger。
+     *
+     * @param parent  当前正在扫描的父节点路径
+     * @param depth   当前递归层级（ZooKeeper的znode层级）
+     * @return 找到所需 ledgerId，如果没有则返回 -1
+     * @throws KeeperException               ZooKeeper 连接或操作异常
+     * @throws InterruptedException          线程中断异常
+     */
     private long getLedgerToRereplicateFromHierarchy(String parent, long depth)
             throws KeeperException, InterruptedException {
-        if (depth == 4) {
+        if (depth == 4) { // 递归到最底层（Ledger节点），实际业务 ledgerId 存储层级为 4 层
             List<String> children;
             try {
+                // 获取当前节点下的所有子节点（即 ledger id 节点）
                 children = subTreeCache.getChildren(parent);
             } catch (KeeperException.NoNodeException nne) {
-                // can occur if another underreplicated ledger's
-                // hierarchy is being cleaned up
+                // 可能其它 ledger 的 underreplicated 层级结构正在被清理，此时该节点不存在
                 return -1;
             }
 
+            // 打乱节点列表，防止每次都处理相同账户；分布式下更均匀
             Collections.shuffle(children);
+            // 获取当前ACL权限
             List<ACL> zkAcls = ZkUtils.getACLs(conf);
+
+            // 遍历所有 ledger 节点
             while (children.size() > 0) {
-                String tryChild = children.get(0);
+                String tryChild = children.get(0); // 取出一个 ledger 节点
                 try {
+                    // 检查 ledger 是否已经被其它线程/进程锁定（防止重复复制）
                     List<String> locks = subTreeCache.getChildren(urLockPath);
                     if (locks.contains(tryChild)) {
+                        // 当前 ledger 已经被锁定，去除并继续检查下一个
                         children.remove(tryChild);
                         continue;
                     }
 
+                    // 检查该 ledger 节点是否真实存在
                     Stat stat = zkc.exists(parent + "/" + tryChild, false);
                     if (stat == null) {
                         if (LOG.isDebugEnabled()) {
-                            LOG.debug("{}/{} doesn't exist", parent, tryChild);
+                            LOG.debug("{}/{} 节点不存在", parent, tryChild);
                         }
                         children.remove(tryChild);
                         continue;
                     }
 
+                    // 尝试对该 ledger 节点加锁（创建临时节点），后续复制过程中保证独占访问
                     String lockPath = urLockPath + "/" + tryChild;
-                    long ledgerId = getLedgerId(tryChild);
+                    long ledgerId = getLedgerId(tryChild); // ledgerId 从 znode 名字解析
                     zkc.create(lockPath, LOCK_DATA, zkAcls, CreateMode.EPHEMERAL);
+
+                    // 记录已持有的锁，方便后继释放和管理
                     heldLocks.put(ledgerId, new Lock(lockPath, Optional.of(stat.getVersion())));
-                    return ledgerId;
+                    return ledgerId; // 返回该 ledgerId，主流程开始复制该账本
                 } catch (KeeperException.NodeExistsException nee) {
+                    // 加锁节点已经存在，说明被别人抢占，去除本节点继续遍历
                     children.remove(tryChild);
                 } catch (NumberFormatException nfe) {
+                    // 节点名称不符合 ledgerId 格式，去除，继续遍历
                     children.remove(tryChild);
                 }
             }
+            // 没有可用的 ledger 节点可处理
             return -1;
         }
 
+        // 递归查找下一层节点（深度小于4时）
         List<String> children;
         try {
             children = subTreeCache.getChildren(parent);
         } catch (KeeperException.NoNodeException nne) {
-            // can occur if another underreplicated ledger's
-            // hierarchy is being cleaned up
+            // 层级被其它进程清理导致该节点不存在
             return -1;
         }
 
-        Collections.shuffle(children);
+        Collections.shuffle(children); // 随机化
 
+        // 遍历所有子节点，递归到下一层，直到找到 ledgerId 或遍历完
         while (children.size() > 0) {
             String tryChild = children.get(0);
             String tryPath = parent + "/" + tryChild;
             long ledger = getLedgerToRereplicateFromHierarchy(tryPath, depth + 1);
             if (ledger != -1) {
+                // 找到ledgerId直接返回
                 return ledger;
             }
-            children.remove(tryChild);
+            children.remove(tryChild); // 当前分支没有需要处理的ledger，继续下一个
         }
+        // 没有找到可用 ledger
         return -1;
     }
+
 
 
     @Override
@@ -597,39 +623,63 @@ public class ZkLedgerUnderreplicationManager implements LedgerUnderreplicationMa
         }
     }
 
+    /**
+     * 从 ZooKeeper 获取一个需要被重新复制（rereplicate）的账本ID。
+     *
+     * 此方法会阻塞直到有 ledger 可供处理（依赖 ZooKeeper 事件驱动），
+     * 并对各类异常做了处理和日志记录。
+     *
+     * @return 需要进行重新复制的账本Id，如果没有则阻塞直到有 ledger 可复制
+     * @throws ReplicationException.UnavailableException 捕获 ZooKeeper 相关不可用或中断异常
+     */
     @Override
     public long getLedgerToRereplicate() throws ReplicationException.UnavailableException {
         if (LOG.isDebugEnabled()) {
             LOG.debug("getLedgerToRereplicate()");
         }
+        // 自旋/阻塞直到找到可用 ledger
         while (true) {
+            // 如果有速率限制器，先做流控
             if (rateLimiter != null) {
                 rateLimiter.acquire();
             }
+
+            // 创建一个计数锁（用于 ZooKeeper watcher 驱动的线程唤醒）
             final CountDownLatch changedLatch = new CountDownLatch(1);
+
+            // 定义 ZooKeeper 事件监听器，当 ZooKeeper 有变更时触发唤醒
             Watcher w = new Watcher() {
                 @Override
                 public void process(WatchedEvent e) {
-                    LOG.info("Latch countdown due to ZK event: " + e);
+                    LOG.info("由于 ZK 事件触发 Latch 倒计时唤醒: " + e);
                     changedLatch.countDown();
                 }
             };
+
             try (SubTreeCache.WatchGuard wg = subTreeCache.registerWatcherWithGuard(w)) {
+                // 检查并等待 ledger 复制是否已禁用（比如临时维护阶段）
                 waitIfLedgerReplicationDisabled();
+
+                // 实际查询账本层级，尝试获取需要重新复制的 ledger id
                 long ledger = getLedgerToRereplicateFromHierarchy(urLedgerPath, 0);
+
                 if (ledger != -1) {
+                    // 找到 LedgerId，直接返回
                     return ledger;
                 }
-                // nothing found, wait for a watcher to trigger
+                // 如果没有 ledger 可处理，则阻塞等待 watcher（由其它线程/进程在 ZooKeeper 更新触发）
                 changedLatch.await();
             } catch (KeeperException ke) {
-                throw ReplicationException.fromKeeperException("Error contacting zookeeper", ke);
+                // ZooKeeper 连接/操作异常，抛出业务异常（ReplicationException 的包装）
+                throw ReplicationException.fromKeeperException("联系 zookeeper 时出错", ke);
             } catch (InterruptedException ie) {
+                // 中断异常，优雅处理，抛出不可用异常
                 Thread.currentThread().interrupt();
-                throw new ReplicationException.UnavailableException("Interrupted while connecting zookeeper", ie);
+                throw new ReplicationException.UnavailableException("连接 zookeeper 时被中断", ie);
             }
         }
     }
+
 
     private void waitIfLedgerReplicationDisabled() throws UnavailableException,
             InterruptedException {

@@ -244,40 +244,49 @@ public class ReplicationWorker implements Runnable {
 
     @Override
     public void run() {
+        // 标记复制工作者线程已启动
         workerRunning = true;
+        // 主循环，线程只要处于运行状态就持续尝试重新复制
         while (workerRunning) {
             try {
+                // 重新复制账本片段。如果返回false，表示本轮复制失败，需要重试
                 if (!rereplicate()) {
-                    LOG.warn("failed while replicating fragments");
+                    LOG.warn("复制账本片段时失败");
+                    // 复制失败后，等待一段退避（backoff）时间再重试
                     waitBackOffTime(rwRereplicateBackoffMs);
                 }
             } catch (InterruptedException e) {
-                LOG.error("InterruptedException "
-                        + "while replicating fragments", e);
+                // 捕获线程中断异常，记录日志并优雅关闭线程，结束循环
+                LOG.error("复制账本片段时被中断", e);
                 shutdown();
                 Thread.currentThread().interrupt();
                 return;
             } catch (BKException e) {
-                LOG.error("BKException while replicating fragments", e);
+                // 捕获 BookKeeper 相关异常，记录日志后等待退避时间，重试
+                LOG.error("复制账本片段时出现 BKException", e);
                 waitBackOffTime(rwRereplicateBackoffMs);
             } catch (ReplicationException.NonRecoverableReplicationException nre) {
-                LOG.error("NonRecoverableReplicationException "
-                        + "while replicating fragments", nre);
+                // 遇到不可恢复的复制异常，需直接关闭线程，结束循环
+                LOG.error("遇到不可恢复的复制异常，无法继续复制账本片段", nre);
                 shutdown();
                 return;
             } catch (UnavailableException e) {
-                LOG.error("UnavailableException "
-                        + "while replicating fragments", e);
+                // 捕获部分资源（如ZooKeeper、BookKeeper节点）不可用的异常，
+                // 记录日志、等待退避时间，必要时优雅关闭线程
+                LOG.error("复制账本片段时出现 UnavailableException", e);
                 waitBackOffTime(rwRereplicateBackoffMs);
+                // 检查当前线程是否被中断，若被中断则关闭并结束循环
                 if (Thread.currentThread().isInterrupted()) {
-                    LOG.error("Interrupted  while replicating fragments");
+                    LOG.error("复制账本片段过程中发生中断");
                     shutdown();
                     return;
                 }
             }
         }
-        LOG.info("ReplicationWorker exited loop!");
+        // 复制工作者主循环退出日志
+        LOG.info("ReplicationWorker 已退出主循环!");
     }
+
 
     private static void waitBackOffTime(long backoffMs) {
         try {
@@ -444,52 +453,69 @@ public class ReplicationWorker implements Runnable {
         return placementNotAdheringFragments;
     }
 
+    /**
+     * 对指定 ledgerId 的账本进行碎片（fragment）重新复制（rereplicate）。
+     * 包括读取未充分复制片段、数据恢复、及锁的管理。
+     *
+     * @param ledgerIdToReplicate 需修复的账本ID
+     * @return true: 账本已完全修复；false: 仍有待修复或 defer（未释放锁）
+     * @throws InterruptedException   线程中断异常
+     * @throws BKException           BookKeeper 相关异常
+     * @throws UnavailableException  某些资源不可用异常（如ZooKeeper等）
+     */
     @SuppressFBWarnings("RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE")
     private boolean rereplicate(long ledgerIdToReplicate) throws InterruptedException, BKException,
             UnavailableException {
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Going to replicate the fragments of the ledger: {}", ledgerIdToReplicate);
+            LOG.debug("准备复制账本片段，LedgerID: {}", ledgerIdToReplicate);
         }
 
-        boolean deferLedgerLockRelease = false;
+        boolean deferLedgerLockRelease = false; // 是否延迟释放ledger锁
 
+        // 使用 LedgerAdmin 打开 ledger（无恢复模式），并自动管理句柄生命周期
         try (LedgerHandle lh = admin.openLedgerNoRecovery(ledgerIdToReplicate)) {
-            Set<LedgerFragment> fragments = getUnderreplicatedFragments(lh,
-                    conf.getAuditorLedgerVerificationPercentage());
+            // 获取所有未充分复制的 LedgerFragment（即 underreplicated fragments）
+            Set<LedgerFragment> fragments = getUnderreplicatedFragments(
+                    lh, conf.getAuditorLedgerVerificationPercentage());
 
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Founds fragments {} for replication from ledger: {}", fragments, ledgerIdToReplicate);
+                LOG.debug("发现 {} 个待修复片段，LedgerID: {}", fragments, ledgerIdToReplicate);
             }
 
-            boolean foundOpenFragments = false;
-            long numFragsReplicated = 0;
-            long numNotAdheringPlacementFragsReplicated = 0;
+            boolean foundOpenFragments = false;  // 标记是否存在未关闭的片段
+            long numFragsReplicated = 0;         // 本次成功修复的片段计数
+            long numNotAdheringPlacementFragsReplicated = 0; // 非正常副本布局的计数
+
+            // 遍历所有未充分复制片段
             for (LedgerFragment ledgerFragment : fragments) {
                 if (!ledgerFragment.isClosed()) {
+                    // 片段未关闭（有客户端在写），跳过，稍后重试
                     foundOpenFragments = true;
                     continue;
                 }
+                // 首先尝试读取故障条目，校验数据可恢复性
                 if (!tryReadingFaultyEntries(lh, ledgerFragment)) {
-                    LOG.error("Failed to read faulty entries, so giving up replicating ledgerFragment {}",
-                            ledgerFragment);
+                    LOG.error("读取故障条目失败，放弃修复 ledgerFragment {}", ledgerFragment);
                     continue;
                 }
                 try {
+                    // 对片段执行实际修复/复制操作
                     admin.replicateLedgerFragment(lh, ledgerFragment, onReadEntryFailureCallback);
                     numFragsReplicated++;
-                    if (ledgerFragment.getReplicateType() == LedgerFragment
-                            .ReplicateType.DATA_NOT_ADHERING_PLACEMENT) {
+                    // 统计因副本分布不符合要求而修复的片段
+                    if (ledgerFragment.getReplicateType() == LedgerFragment.ReplicateType.DATA_NOT_ADHERING_PLACEMENT) {
                         numNotAdheringPlacementFragsReplicated++;
                     }
                 } catch (BKException.BKBookieHandleNotAvailableException e) {
-                    LOG.warn("BKBookieHandleNotAvailableException while replicating the fragment", e);
+                    LOG.warn("修复片段时 bookie 不可用异常", e);
                 } catch (BKException.BKLedgerRecoveryException e) {
-                    LOG.warn("BKLedgerRecoveryException while replicating the fragment", e);
+                    LOG.warn("账本恢复异常", e);
                 } catch (BKException.BKNotEnoughBookiesException e) {
-                    LOG.warn("BKNotEnoughBookiesException while replicating the fragment", e);
+                    LOG.warn("可用 bookie 不足，无法修复片段", e);
                 }
             }
 
+            // 统计本批次修复情况
             if (numFragsReplicated > 0) {
                 numLedgersReplicated.inc();
             }
@@ -497,55 +523,55 @@ public class ReplicationWorker implements Runnable {
                 numNotAdheringPlacementLedgersReplicated.inc();
             }
 
+            // 处理未关闭的片段或最后一段（open segment）缺失 bookie 的场景
             if (foundOpenFragments || isLastSegmentOpenAndMissingBookies(lh)) {
-                deferLedgerLockRelease = true;
-                deferLedgerLockRelease(ledgerIdToReplicate);
-                return false;
+                deferLedgerLockRelease = true; // 设置延迟释放锁
+                deferLedgerLockRelease(ledgerIdToReplicate); // 做延迟释放
+                return false; // 本轮不成功，等待稍后由 worker 继续抢占处理
             }
 
+            // 再次校验是否还有未修复片段
             fragments = getUnderreplicatedFragments(lh, conf.getAuditorLedgerVerificationPercentage());
             if (fragments.size() == 0) {
-                LOG.info("Ledger replicated successfully. ledger id is: " + ledgerIdToReplicate);
+                // 已全部修复，记录日志并做标记
+                LOG.info("Ledger 修复成功，ledger id: " + ledgerIdToReplicate);
                 underreplicationManager.markLedgerReplicated(ledgerIdToReplicate);
                 return true;
             } else {
+                // 存在未修复片段（可能本次遇到新异常），延迟释放锁，下次继续竞争处理
                 deferLedgerLockRelease = true;
                 deferLedgerLockReleaseOfFailedLedger(ledgerIdToReplicate);
                 numDeferLedgerLockReleaseOfFailedLedger.inc();
-                // Releasing the underReplication ledger lock and compete
-                // for the replication again for the pending fragments
                 return false;
             }
 
         } catch (BKNoSuchLedgerExistsOnMetadataServerException e) {
-            // Ledger might have been deleted by user
-            LOG.info("BKNoSuchLedgerExistsOnMetadataServerException while opening "
-                + "ledger {} for replication. Other clients "
-                + "might have deleted the ledger. "
-                + "So, no harm to continue", ledgerIdToReplicate);
+            // 账本已被删除（如用户操作），无需修复，直接标记并返回
+            LOG.info("账本已被删除，无需修复，ledger id: " + ledgerIdToReplicate);
             underreplicationManager.markLedgerReplicated(ledgerIdToReplicate);
             getExceptionCounter("BKNoSuchLedgerExistsOnMetadataServerException").inc();
             return false;
         } catch (BKNotEnoughBookiesException e) {
+            // 可用 Bookie 不足，需要特殊处理，并上抛异常
             logBKExceptionAndReleaseLedger(e, ledgerIdToReplicate);
             throw e;
         } catch (BKException e) {
+            // 其它 BookKeeper 异常，释放锁，记录日志
             logBKExceptionAndReleaseLedger(e, ledgerIdToReplicate);
             return false;
         } finally {
-            // we make sure we always release the underreplicated lock, unless we decided to defer it. If the lock has
-            // already been released, this is a no-op
+            // 最终（即使异常）都保证 ledger 的处理锁会被释放（除非 defer 状态已明确延迟释放）
             if (!deferLedgerLockRelease) {
                 try {
                     underreplicationManager.releaseUnderreplicatedLedger(ledgerIdToReplicate);
                 } catch (UnavailableException e) {
-                    LOG.error("UnavailableException while releasing the underreplicated lock for ledger {}:",
-                        ledgerIdToReplicate, e);
+                    LOG.error("释放 ledger 修复锁时出现 UnavailableException：" + ledgerIdToReplicate, e);
                     shutdown();
                 }
             }
         }
     }
+
 
 
     /**
@@ -603,27 +629,38 @@ public class ReplicationWorker implements Runnable {
     }
 
     /**
-     * Gets the under replicated fragments.
+     * 获取指定账本（LedgerHandle）下所有未充分复制的片段（fragment）。
+     * 优先处理数据丢失片段（data_loss），其后处理副本分布不符合要求的片段（not_adhering_placement）。
+     * 如果同时属于两者，本轮只修复数据丢失，待其修复后若仍不符合分布要求，将再次被 Auditor 标记处理。
+     *
+     * @param lh                        账本句柄
+     * @param ledgerVerificationPercentage 账本校验百分比（可用于采样，提升性能）
+     * @return 需要修复的所有未充分复制片段（LedgerFragment 集合）
+     * @throws InterruptedException     线程中断异常
      */
     Set<LedgerFragment> getUnderreplicatedFragments(LedgerHandle lh, Long ledgerVerificationPercentage)
             throws InterruptedException {
-        //The data loss fragments is first to repair. If a fragment is data_loss and not_adhering_placement
-        //at the same time, we only fix data_loss in this time. After fix data_loss, the fragment is still
-        //not_adhering_placement, Auditor will mark this ledger again.
+        // 首选要修复的数据丢失片段。如果一个片段既 data_loss 又 not_adhering_placement，优先本轮只修数据丢失
         Set<LedgerFragment> underreplicatedFragments = new HashSet<>();
 
+        // 找到所有数据丢失片段（损坏片段，需优先修复），可指定校验比例
         Set<LedgerFragment> dataLossFragments = getDataLossFragments(lh, ledgerVerificationPercentage);
         underreplicatedFragments.addAll(dataLossFragments);
 
+        // 找到所有副本分布不符要求的片段（比如副本没按要求落在不同 bookie 上）
         Set<LedgerFragment> notAdheringFragments = getNeedRepairedPlacementNotAdheringFragments(lh);
 
+        // 如果某个片段既在 data_loss 又在 not_adhering_placement，跳过，只修一次（优先 data_loss）
+        // 其余不重复的片段正常加入本轮修复集合
         for (LedgerFragment notAdheringFragment : notAdheringFragments) {
             if (!checkFragmentRepeat(underreplicatedFragments, notAdheringFragment)) {
                 underreplicatedFragments.add(notAdheringFragment);
             }
         }
+        // 返回需要修复的所有片段集合
         return underreplicatedFragments;
     }
+
 
     private Set<LedgerFragment> getDataLossFragments(LedgerHandle lh, Long ledgerVerificationPercentage)
             throws InterruptedException {

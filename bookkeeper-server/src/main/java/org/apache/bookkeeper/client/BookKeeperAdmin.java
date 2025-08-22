@@ -1128,54 +1128,118 @@ public class BookKeeperAdmin implements AutoCloseable {
     }
 
     /**
-     * Replicate the Ledger fragment to target Bookie passed.
+     * 将 Ledger Fragment 复制到指定的目标 Bookie。
      *
      * @param lh
-     *            - ledgerHandle
+     *            - ledgerHandle，账本句柄
      * @param ledgerFragment
-     *            - LedgerFragment to replicate
+     *            - LedgerFragment，需要复制的账本片段
+     * @param onReadEntryFailureCallback
+     *            - 读取 entry 失败时的回调函数
+     * @throws InterruptedException
+     *            - 操作被中断异常
+     * @throws BKException
+     *            - BookKeeper 相关异常
      */
-    public void replicateLedgerFragment(LedgerHandle lh, final LedgerFragment ledgerFragment,
-            final BiConsumer<Long, Long> onReadEntryFailureCallback) throws InterruptedException, BKException {
-        Map<Integer, BookieId> targetBookieAddresses = null;
+    public void replicateLedgerFragment(
+            LedgerHandle lh,                       // ledger 句柄
+            final LedgerFragment ledgerFragment,    // 账本片段
+            final BiConsumer<Long, Long> onReadEntryFailureCallback // entry 读取失败回调
+    ) throws InterruptedException, BKException {
+        Map<Integer, BookieId> targetBookieAddresses = null; // 目标 Bookie 节点地址
+
+        // 如果是因数据丢失需要复制
         if (LedgerFragment.ReplicateType.DATA_LOSS == ledgerFragment.getReplicateType()) {
-            Optional<Set<BookieId>> excludedBookies = Optional.empty();
-            targetBookieAddresses = getReplacementBookiesByIndexes(lh, ledgerFragment.getEnsemble(),
-                    ledgerFragment.getBookiesIndexes(), excludedBookies);
-        } else if (LedgerFragment.ReplicateType.DATA_NOT_ADHERING_PLACEMENT == ledgerFragment.getReplicateType()) {
-            targetBookieAddresses = replaceNotAdheringPlacementPolicyBookie(ledgerFragment.getEnsemble(),
-                    lh.getLedgerMetadata().getWriteQuorumSize(), lh.getLedgerMetadata().getAckQuorumSize());
-            ledgerFragment.getBookiesIndexes().addAll(targetBookieAddresses.keySet());
+            Optional<Set<BookieId>> excludedBookies = Optional.empty(); // 不排除任何 Bookie
+            targetBookieAddresses = getReplacementBookiesByIndexes(
+                    lh,
+                    ledgerFragment.getEnsemble(),         // 原有副本组
+                    ledgerFragment.getBookiesIndexes(),   // 需要替换的 Bookie 索引
+                    excludedBookies
+            );
         }
+        // 如果是因为副本分布不符合 Placement Policy
+        else if (LedgerFragment.ReplicateType.DATA_NOT_ADHERING_PLACEMENT == ledgerFragment.getReplicateType()) {
+            targetBookieAddresses = replaceNotAdheringPlacementPolicyBookie(
+                    ledgerFragment.getEnsemble(),                    // 原有副本组
+                    lh.getLedgerMetadata().getWriteQuorumSize(),     // 写入 Quorum 大小
+                    lh.getLedgerMetadata().getAckQuorumSize()        // Ack Quorum 大小
+            );
+            ledgerFragment.getBookiesIndexes().addAll(targetBookieAddresses.keySet()); // 将新替换的 Bookie 索引加入片段
+        }
+
+        // 如果没有找到目标 Bookie，记录警告日志并抛出异常
         if (MapUtils.isEmpty(targetBookieAddresses)) {
             LOG.warn("Could not replicate for {} ledger: {}, not find target bookie.",
-                    ledgerFragment.getReplicateType(), ledgerFragment.getLedgerId());
-            throw new BKException.BKLedgerRecoveryException();
+                    ledgerFragment.getReplicateType(),
+                    ledgerFragment.getLedgerId()
+            );
+            throw new BKException.BKLedgerRecoveryException(); // 抛出账本恢复异常
         }
-        replicateLedgerFragment(lh, ledgerFragment, targetBookieAddresses, onReadEntryFailureCallback);
+
+        // 调用复制片段方法，进行真正的复制操作
+        replicateLedgerFragment(
+                lh,
+                ledgerFragment,
+                targetBookieAddresses,
+                onReadEntryFailureCallback
+        );
     }
 
-    private void replicateLedgerFragment(LedgerHandle lh,
-            final LedgerFragment ledgerFragment,
-            final Map<Integer, BookieId> targetBookieAddresses,
-            final BiConsumer<Long, Long> onReadEntryFailureCallback)
-            throws InterruptedException, BKException {
-        CompletableFuture<Void> result = new CompletableFuture<>();
-        ResultCallBack resultCallBack = new ResultCallBack(result);
-        SingleFragmentCallback cb = new SingleFragmentCallback(
-            resultCallBack,
-            lh,
-            bkc.getLedgerManager(),
-            ledgerFragment.getFirstEntryId(),
-            getReplacementBookiesMap(ledgerFragment, targetBookieAddresses));
 
+    /**
+     * 复制 LedgerFragment 到目标 Bookie 节点
+     *
+     * @param lh
+     *            - LedgerHandle，账本句柄
+     * @param ledgerFragment
+     *            - LedgerFragment，要复制的账本片段
+     * @param targetBookieAddresses
+     *            - Map<Integer, BookieId> 目标 Bookie 地址映射（索引->BookieId）
+     * @param onReadEntryFailureCallback
+     *            - entry 读取失败的回调函数
+     * @throws InterruptedException
+     *            - 操作被中断异常
+     * @throws BKException
+     *            - BookKeeper 相关异常
+     */
+    private void replicateLedgerFragment(
+            LedgerHandle lh,                                // 账本句柄
+            final LedgerFragment ledgerFragment,            // 账本片段
+            final Map<Integer, BookieId> targetBookieAddresses, // 目标 Bookie 地址映射
+            final BiConsumer<Long, Long> onReadEntryFailureCallback // 读取 entry 失败回调
+    ) throws InterruptedException, BKException {
+        // 用于异步结果通知的 CompletableFuture 对象
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        ResultCallBack resultCallBack = new ResultCallBack(result); // 异步调用结果回调
+
+        // 构造单个片段处理回调
+        SingleFragmentCallback cb = new SingleFragmentCallback(
+                resultCallBack,                          // 结果回调
+                lh,                                      // 账本句柄
+                bkc.getLedgerManager(),                  // Ledger 管理器
+                ledgerFragment.getFirstEntryId(),        // 片段的第一个 entry ID
+                getReplacementBookiesMap(ledgerFragment, targetBookieAddresses) // 获取替换 Bookie 的映射
+        );
+
+        // 构造目标 Bookie 节点集合
         Set<BookieId> targetBookieSet = Sets.newHashSet();
         targetBookieSet.addAll(targetBookieAddresses.values());
-        asyncRecoverLedgerFragment(lh, ledgerFragment, cb, targetBookieSet, onReadEntryFailureCallback);
 
+        // 异步恢复 ledger 片段
+        asyncRecoverLedgerFragment(
+                lh,
+                ledgerFragment,
+                cb,
+                targetBookieSet,                    // 目标 Bookie 集合
+                onReadEntryFailureCallback          // entry 读取失败回调
+        );
+
+        // 等待异步结果，出现异常则抛出
         try {
-            SyncCallbackUtils.waitForResult(result);
+            SyncCallbackUtils.waitForResult(result); // 阻塞直到异步恢复完成
         } catch (BKException err) {
+            // 转换并抛出 BookKeeper 异常
             throw BKException.create(bkc.getReturnRc(err.getCode()));
         }
     }
