@@ -21,21 +21,28 @@
 
 package org.apache.bookkeeper.bookie;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.io.File;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.bookkeeper.bookie.LedgerDirsManager.LedgerDirsListener;
 import org.apache.bookkeeper.bookie.LedgerDirsManager.NoWritableLedgerDirException;
+import org.apache.bookkeeper.bookie.storage.ldb.DbLedgerStorage;
 import org.apache.bookkeeper.client.BookKeeper.DigestType;
 import org.apache.bookkeeper.client.LedgerHandle;
 import org.apache.bookkeeper.common.testing.annotations.FlakyTest;
 import org.apache.bookkeeper.conf.ServerConfiguration;
+import org.apache.bookkeeper.conf.TestBKConfiguration;
 import org.apache.bookkeeper.proto.BookieServer;
 import org.apache.bookkeeper.test.BookKeeperClusterTestCase;
 import org.apache.bookkeeper.util.DiskChecker;
@@ -250,4 +257,113 @@ public class BookieStorageThresholdTest extends BookKeeperClusterTestCase {
         Thread.sleep(500);
         assertFalse("Bookie should be transitioned to ReadWrite", bookie.isReadOnly());
     }
+
+    @org.junit.Test
+    public void testOneDirectoryFull() throws Exception {
+        // 1. 创建测试目录
+        File ledgerDir1 = tmpDirs.createNew("ledger", "test1");
+        File ledgerDir2 = tmpDirs.createNew("ledger", "test2");
+
+        // 2. 配置Bookie
+        ServerConfiguration conf = TestBKConfiguration.newServerConfiguration();
+        conf.setGcWaitTime(1000);
+        conf.setLedgerDirNames(new String[] { ledgerDir1.getPath(), ledgerDir2.getPath() });
+        conf.setDiskCheckInterval(100); // 缩短磁盘检查间隔
+        conf.setLedgerStorageClass(DbLedgerStorage.class.getName());
+
+        // 3. 启动Bookie并获取内部组件
+        Bookie bookie = new TestBookieImpl(conf);
+        BookieImpl bookieImpl = (BookieImpl) bookie;
+        LedgerDirsManager ledgerDirsManager = bookieImpl.getLedgerDirsManager();
+
+        // 4. 创建自定义磁盘检查器（关键步骤）
+        GCTestDiskChecker diskChecker = new GCTestDiskChecker(
+                conf.getDiskUsageThreshold(),
+                conf.getDiskUsageWarnThreshold()
+        );
+        // 设置目录状态：dir1满(100%)，dir2正常(50%)
+        File[] currentDirectories = BookieImpl.getCurrentDirectories(new File[] { ledgerDir1, ledgerDir2 });
+        diskChecker.setUsageMap(currentDirectories[0], 1.0f);  // 100%使用率
+        diskChecker.setUsageMap(currentDirectories[1], 0.5f); // 50%使用率
+
+        // 5. 替换Bookie的磁盘检查器
+        bookieImpl.dirsMonitor.shutdown(); // 停止默认监控
+        bookieImpl.dirsMonitor = new LedgerDirsMonitor(
+                conf,
+                diskChecker,
+                Collections.singletonList(ledgerDirsManager)
+        );
+        bookieImpl.dirsMonitor.start();
+
+        // 6. 添加磁盘状态监听器
+        CountDownLatch dir1Full = new CountDownLatch(1);
+        CountDownLatch dir2Writable = new CountDownLatch(1);
+
+        ledgerDirsManager.addLedgerDirsListener(new LedgerDirsListener() {
+            @Override
+            public void diskFull(File disk) {
+                if (disk.equals(currentDirectories[0])) dir1Full.countDown();
+            }
+
+            @Override
+            public void diskWritable(File disk) {
+                if (disk.equals(ledgerDir2)) dir2Writable.countDown();
+            }
+        });
+
+        // 7. 等待状态更新（确保事件触发）
+        assertTrue("dir1未触发满状态", dir1Full.await(3, TimeUnit.SECONDS));
+
+        // 8. 验证目录状态
+        List<File> fullDirs = ledgerDirsManager.getFullFilledLedgerDirs();
+        List<File> writableDirs = ledgerDirsManager.getWritableLedgerDirs();
+
+        assertTrue("dir1应被标记为满", fullDirs.contains(currentDirectories[0]));
+        assertTrue("dir2应保持可写", writableDirs.contains(currentDirectories[1]));
+        assertEquals("应只有1个可写目录", 1, writableDirs.size());
+
+        // 9. 验证GC状态
+        ((DbLedgerStorage)bookieImpl.ledgerStorage).getLedgerStorageList().forEach(storage -> {
+            if (Objects.equals(storage.getCurrentFile(), currentDirectories[0])) {
+                assertTrue("dir1应停止小型压缩", storage.isMinorGcSuspended());
+                assertTrue("dir1应停止大型压缩", storage.isMajorGcSuspended());
+            } else {
+                assertFalse("dir2不应停止小型压缩", storage.isMinorGcSuspended());
+                assertFalse("dir2不应停止小型压缩", storage.isMajorGcSuspended());
+            }
+        });
+
+        // 10. 清理
+        bookie.shutdown();
+    }
+
+    // 自定义磁盘检查器（模拟不同目录的磁盘状态）
+    static class GCTestDiskChecker extends DiskChecker {
+        private final Map<File, Float> usageMap = new ConcurrentHashMap<>();
+
+        public GCTestDiskChecker(float threshold, float warnThreshold) {
+            super(threshold, warnThreshold);
+        }
+
+        // 设置目录的模拟使用率
+        public void setUsageMap(File dir, float usage) {
+            usageMap.put(dir, usage);
+        }
+
+        @Override
+        public float checkDir(File dir) throws DiskErrorException, DiskWarnThresholdException, DiskOutOfSpaceException {
+            Float usage = usageMap.get(dir);
+            if (usage == null) {
+                return super.checkDir(dir); // 默认行为
+            }
+            // 根据预设使用率抛出异常
+            if (usage >= 1.0) {
+                throw new DiskOutOfSpaceException("模拟磁盘满", usage);
+            } else if (usage >= 9.0) {
+                throw new DiskWarnThresholdException("模拟磁盘警告", usage);
+            }
+            return usage;
+        }
+    }
+
 }

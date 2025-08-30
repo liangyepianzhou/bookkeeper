@@ -39,6 +39,7 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.PrimitiveIterator.OfLong;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
@@ -149,6 +150,7 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
 
     private final Counter flushExecutorTime;
     private final boolean singleLedgerDirs;
+    private final File currentFile;
 
     public SingleDirectoryDbLedgerStorage(ServerConfiguration conf, LedgerManager ledgerManager,
                                           LedgerDirsManager ledgerDirsManager, LedgerDirsManager indexDirsManager,
@@ -158,7 +160,7 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
             throws IOException {
         checkArgument(ledgerDirsManager.getAllLedgerDirs().size() == 1,
                 "Db implementation only allows for one storage dir");
-
+        currentFile = ledgerDirsManager.getAllLedgerDirs().get(0);
         String ledgerBaseDir = ledgerDirsManager.getAllLedgerDirs().get(0).getPath();
         // indexBaseDir default use ledgerBaseDir
         String indexBaseDir = ledgerBaseDir;
@@ -1201,6 +1203,11 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
              */
             @Override
             public void diskAlmostFull(File disk) {
+                if (Objects.equals(disk.getPath(), currentFile.getPath())) {
+                    // 只处理当前使用的磁盘
+                    return;
+                }
+                log.warn("磁盘 {} 空间接近满", currentFile.getPath());
                 if (gcThread.isForceGCAllowWhenNoSpace()) {
                     gcThread.enableForceGC();
                 } else {
@@ -1217,9 +1224,13 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
             public void diskFull(File disk) {
                 if (gcThread.isForceGCAllowWhenNoSpace()) {
                     gcThread.enableForceGC();
-                } else {
+                } else if (Objects.equals(disk.getPath(), currentFile.getPath())) {
+                    // 只处理当前使用的磁盘
+                    log.error("磁盘 {} 空间已满", currentFile.getPath());
                     gcThread.suspendMajorGC();
                     gcThread.suspendMinorGC();
+                } else {
+                    log.warn("磁盘 {} 空间已满", currentFile.getPath());
                 }
             }
 
@@ -1365,5 +1376,10 @@ public class SingleDirectoryDbLedgerStorage implements CompactableLedgerStorage 
     @VisibleForTesting
     DbLedgerStorageStats getDbLedgerStorageStats() {
         return dbLedgerStorageStats;
+    }
+
+    @VisibleForTesting
+    public File getCurrentFile() {
+        return currentFile;
     }
 }

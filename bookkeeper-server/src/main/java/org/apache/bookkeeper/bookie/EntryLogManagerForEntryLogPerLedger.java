@@ -264,55 +264,71 @@ class EntryLogManagerForEntryLogPerLedger extends EntryLogManagerBase {
     private final StatsLogger statsLogger;
     final EntryLogsPerLedgerCounter entryLogsPerLedgerCounter;
 
+    // EntryLogManagerForEntryLogPerLedger 构造函数
     EntryLogManagerForEntryLogPerLedger(ServerConfiguration conf, LedgerDirsManager ledgerDirsManager,
                                         EntryLoggerAllocator entryLoggerAllocator,
                                         List<DefaultEntryLogger.EntryLogListener> listeners,
                                         DefaultEntryLogger.RecentEntryLogsStatus recentlyCreatedEntryLogsStatus,
                                         StatsLogger statsLogger) throws IOException {
+        // 调用父类构造函数，初始化基础属性
         super(conf, ledgerDirsManager, entryLoggerAllocator, listeners);
+
+        // 初始化最近创建的 EntryLog 状态
         this.recentlyCreatedEntryLogsStatus = recentlyCreatedEntryLogsStatus;
+        // 旋转日志通道列表（支持并发，写时复制）
         this.rotatedLogChannels = new CopyOnWriteArrayList<BufferedLogChannel>();
+        // 当前日志通道副本（根据 ledgerId 字段查找，支持并发）
         this.replicaOfCurrentLogChannels =
                 ConcurrentLongHashMap.<BufferedLogChannelWithDirInfo>newBuilder().build();
+        // 访问 entrylogMap 过期时间（秒）
         this.entrylogMapAccessExpiryTimeInSeconds = conf.getEntrylogMapAccessExpiryTimeInSeconds();
+        // 活动 EntryLog 的最大数量限制
         this.maximumNumberOfActiveEntryLogs = conf.getMaximumNumberOfActiveEntryLogs();
+        // ledger 计数器限制倍率因子
         this.entryLogPerLedgerCounterLimitsMultFactor = conf.getEntryLogPerLedgerCounterLimitsMultFactor();
 
+        // 注册 LedgerDirsListener 目录变更监听
         ledgerDirsManager.addLedgerDirsListener(getLedgerDirsListener());
+        // 锁数组池，大小为最大活动 EntryLog 的两倍
         this.lockArrayPool = new AtomicReferenceArray<Lock>(maximumNumberOfActiveEntryLogs * 2);
+
+        // 定义 CacheLoader 加载器，按 ledgerId 加载 EntryLogAndLockTuple 对象
         this.entryLogAndLockTupleCacheLoader = new CacheLoader<Long, EntryLogAndLockTuple>() {
             @Override
             public EntryLogAndLockTuple load(Long key) throws Exception {
                 return new EntryLogAndLockTuple(key);
             }
         };
+
         /*
-         * Currently we are relying on access time based eviction policy for
-         * removal of EntryLogAndLockTuple, so if the EntryLogAndLockTuple of
-         * the ledger is not accessed in
-         * entrylogMapAccessExpiryTimeInSeconds period, it will be removed
-         * from the cache.
+         * 当前依赖于访问时间驱逐策略自动移除 EntryLogAndLockTuple，
+         * 如果某 ledger 的 EntryLogAndLockTuple 在 entrylogMapAccessExpiryTimeInSeconds 时间内未被访问，则会自动从缓存移除。
          *
-         * We are going to introduce explicit advisory writeClose call, with
-         * that explicit call EntryLogAndLockTuple of the ledger will be
-         * removed from the cache. But still timebased eviciton policy is
-         * needed because it is not guaranteed that Bookie/EntryLogger would
-         * receive successfully write close call in all the cases.
+         * 未来会引入显式的 advisory writeClose 调用，届时可以明确地从缓存移除 Tuple。
+         * 但仍需保留基于时间的策略，以应对异常情况下不能收到 write close 调用的状况。
          */
         ledgerIdEntryLogMap = CacheBuilder.newBuilder()
+                // 设置访问过期时间：entrylogMapAccessExpiryTimeInSeconds 秒
                 .expireAfterAccess(entrylogMapAccessExpiryTimeInSeconds, TimeUnit.SECONDS)
+                // 设置缓存最大大小：maximumNumberOfActiveEntryLogs
                 .maximumSize(maximumNumberOfActiveEntryLogs)
+                // 移除监听器：Tuple 被移除时触发 onCacheEntryRemoval 方法
                 .removalListener(new RemovalListener<Long, EntryLogAndLockTuple>() {
                     @Override
                     public void onRemoval(
                             RemovalNotification<Long, EntryLogAndLockTuple> expiredLedgerEntryLogMapEntry) {
                         onCacheEntryRemoval(expiredLedgerEntryLogMapEntry);
                     }
-                }).build(entryLogAndLockTupleCacheLoader);
+                })
+                // 加载器（上述定义的 CacheLoader）
+                .build(entryLogAndLockTupleCacheLoader);
 
+        // 统计日志对象
         this.statsLogger = statsLogger;
+        // ledger 维度的 entry log 计数器
         this.entryLogsPerLedgerCounter = new EntryLogsPerLedgerCounter(this.statsLogger);
     }
+
 
     /*
      * This method is called when an entry is removed from the cache. This could
@@ -561,23 +577,31 @@ class EntryLogManagerForEntryLogPerLedger extends EntryLogManagerBase {
         return ledgerIdEntryLogMap.asMap();
     }
     /*
-     * Returns writable ledger dir with least number of current active
-     * entrylogs.
+     * 返回拥有当前活跃 entrylog 数量最少的可写 ledger 目录
      */
     @Override
     public File getDirForNextEntryLog(List<File> writableLedgerDirs) {
+        // 创建一个映射，记录每个可写 ledger 目录当前活跃 entrylog 的数量，初始为0
         Map<File, MutableInt> writableLedgerDirFrequency = new HashMap<File, MutableInt>();
         writableLedgerDirs.stream()
                 .forEach((ledgerDir) -> writableLedgerDirFrequency.put(ledgerDir, new MutableInt()));
+
+        // 遍历所有当前日志通道，统计每个目录中的活跃日志数
         for (BufferedLogChannelWithDirInfo logChannelWithDirInfo : replicaOfCurrentLogChannels.values()) {
+            // 获取当前日志通道文件的父目录
             File parentDirOfCurrentLogChannel = logChannelWithDirInfo.getLogChannel().getLogFile().getParentFile();
             if (writableLedgerDirFrequency.containsKey(parentDirOfCurrentLogChannel)) {
+                // 如果该目录可写，则该目录的日志数+1
                 writableLedgerDirFrequency.get(parentDirOfCurrentLogChannel).increment();
             }
         }
+
+        // 在所有可写目录中找到拥有当前活跃 entrylog 最少的目录
         @SuppressWarnings("unchecked")
         Optional<Entry<File, MutableInt>> ledgerDirWithLeastNumofCurrentLogs = writableLedgerDirFrequency.entrySet()
                 .stream().min(Map.Entry.comparingByValue());
+
+        // 返回拥有最少日志数的目录
         return ledgerDirWithLeastNumofCurrentLogs.get().getKey();
     }
 
@@ -639,46 +663,55 @@ class EntryLogManagerForEntryLogPerLedger extends EntryLogManagerBase {
         }
     }
 
-
     @Override
     BufferedLogChannel getCurrentLogForLedgerForAddEntry(long ledgerId, int entrySize, boolean rollLog)
             throws IOException {
+        // 获取与指定 ledgerId 相关的锁
         Lock lock = getLock(ledgerId);
         lock.lock();
         try {
+            // 获取当前 Ledger 对应的日志通道以及其目录信息
             BufferedLogChannelWithDirInfo logChannelWithDirInfo = getCurrentLogWithDirInfoForLedger(ledgerId);
             BufferedLogChannel logChannel = null;
             if (logChannelWithDirInfo != null) {
+                // 若日志通道信息不为空，则获取具体的日志通道
                 logChannel = logChannelWithDirInfo.getLogChannel();
             }
+            // 检查是否到达 entry log 限制
+            // rollLog 为 true 时检测软限制，否则检测硬限制
             boolean reachEntryLogLimit = rollLog ? reachEntryLogLimit(logChannel, entrySize)
                     : readEntryLogHardLimit(logChannel, entrySize);
-            // Create new log if logSizeLimit reached or current disk is full
+            // 若日志大小达到限制或当前磁盘已满则创建新日志
             boolean diskFull = (logChannel == null) ? false : logChannelWithDirInfo.isLedgerDirFull();
+            // 检查是否所有磁盘都不可写
             boolean allDisksFull = !ledgerDirsManager.hasWritableLedgerDirs();
 
             /**
-             * if disk of the logChannel is full or if the entrylog limit is
-             * reached of if the logchannel is not initialized, then
-             * createNewLog. If allDisks are full then proceed with the current
-             * logChannel, since Bookie must have turned to readonly mode and
-             * the addEntry traffic would be from GC and it is ok to proceed in
-             * this case.
+             * 逻辑说明：
+             * 如果当前日志通道的磁盘已满，或者日志通道达到大小限制，或者日志通道尚未初始化，
+             * 则需要创建新日志。
+             * 如果所有磁盘都已满（Bookie进入只读模式），就继续使用当前日志通道，
+             * 这种情况下 addEntry 操作只可能是 GC（垃圾回收），可以继续写入。
              */
             if ((diskFull && (!allDisksFull)) || reachEntryLogLimit || (logChannel == null)) {
                 if (logChannel != null) {
+                    // 如果当前日志通道不为空，则进行冲刷并强制写盘
                     logChannel.flushAndForceWriteIfRegularFlush(false);
                 }
+                // 创建新的日志通道
                 createNewLog(ledgerId,
-                    ": diskFull = " + diskFull + ", allDisksFull = " + allDisksFull
-                        + ", reachEntryLogLimit = " + reachEntryLogLimit + ", logChannel = " + logChannel);
+                        ": diskFull = " + diskFull + ", allDisksFull = " + allDisksFull
+                                + ", reachEntryLogLimit = " + reachEntryLogLimit + ", logChannel = " + logChannel);
             }
 
+            // 返回当前 ledger 的日志通道（可能是新创建的）
             return getCurrentLogForLedger(ledgerId);
         } finally {
+            // 解锁
             lock.unlock();
         }
     }
+
 
     @Override
     public void flushRotatedLogs() throws IOException {

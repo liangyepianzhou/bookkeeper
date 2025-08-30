@@ -142,9 +142,16 @@ class EntryLogManagerForSingleEntryLog extends EntryLogManagerBase {
         return null;
     }
 
+    /**
+     * 从可写的账本目录列表中随机选择一个用于下一个日志条目的目录
+     * @param writableLedgerDirs 可写的账本目录列表
+     * @return 随机选择的目录
+     */
     @Override
     public File getDirForNextEntryLog(List<File> writableLedgerDirs) {
+        // 随机打乱列表顺序
         Collections.shuffle(writableLedgerDirs);
+        // 返回第一个目录（即随机选择的目录）
         return writableLedgerDirs.get(0);
     }
 

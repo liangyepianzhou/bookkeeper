@@ -1,0 +1,27 @@
+[DISCUSS] Should a full disk block GC on other disks?
+
+Hi BookKeeper Community,
+
+I’d like to propose a modification to how garbage collection (GC) handles disk-full scenarios.
+Currently, when any ledger disk reaches full capacity, `suspendMajorGC()`/`suspendMinorGC()` pauses GC for all disks.
+This behavior can unnecessarily impact healthy disks, especially in cases of uneven disk utilization.
+
+考虑两个场景：
+1. Even Data Distribution:
+   All disks are near full, and one fills first. Temporarily disabling GC only on the full disk (before propagating suspension to others) is safe.
+2. Uneven Data Distribution:
+   Due to write skew or cleanup inconsistencies, a single disk may fill while others have free space. Halting GC globally penalizes operational disks.
+
+To address this, I 准备了三个解决方案:
+
+方案1: 复用isReadOnlyModeOnAnyDiskFullEnabled，  When isReadOnlyModeOnAnyDiskFullEnabled == true, stop GC on all disks.
+ Otherwise, other disks should continue normal operations without GC suspension.
+理由：isReadOnlyModeOnAnyDiskFullEnabled 表达了用户对 是否在任何单个磁盘满时停止其他bookie写入数据的意图，而GC会先创建新文件写入数据。
+
+方案2：When a single disk becomes full, only stop GC for that specific disk. Other disks should continue their GC processes uninterrupted.
+理由：这应该问题是一个bug fix，而不是被认为是break change。不需要任何配置，仅仅修复现有行为。
+
+方案3: Add a new configuration to control whether to stop GC on other disks when any single disk becomes full.
+理由：这没有改变现有行为，但允许用户根据需要进行配置。
+
+我认为方案2是最合适的，因为它直接解决了问题而不引入额外的配置复杂性。
