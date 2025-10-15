@@ -15,12 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# Description (English comments):
-# This GitHub Actions workflow enables the use of the /bkbot command in PR/Issue comments to rerun failed CI workflow(s).
-# Supported commands:
-# - /bkbot rerun            => Rerun all failed workflows
-# - /bkbot rerun <keyword>  => Only rerun failed workflows whose name contains the given keyword
-# Only triggered when a new comment containing /bkbot is created.
+# 说明（中文注释）：
+# 该 GitHub Actions 工作流用于在 PR/Issue 评论中使用命令 /bkbot 来重跑失败的 CI 工作流。
+# 仅支持命令：/bkbot rerun [关键字]
+# - /bkbot rerun            => 重跑所有失败的工作流
+# - /bkbot rerun <关键字>    => 仅重跑名称包含该关键字的失败工作流
+# 仅当新评论创建且包含 /bkbot 时触发。
 
 name: BookKeeper Bot
 
@@ -36,7 +36,7 @@ jobs:
   bkbot:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # Only run if the event is issue_comment and the comment contains '/bkbot'
+    # 仅当事件为 issue_comment 且评论内容包含 '/bkbot' 时才运行
     if: github.event_name == 'issue_comment' && contains(github.event.comment.body, '/bkbot')
     steps:
       - name: Execute bkbot command
@@ -44,56 +44,55 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // Read comment text and trim whitespace
+            // 读取评论文本并去除首尾空白
             const commentBody = context.payload.comment.body.trim();
-            // Bot command prefix
+            // 机器人命令前缀
             const botCommandPrefix = '/bkbot';
-            // Target repository info (owner/repo)
+            // 目标仓库信息（owner/repo）
             const botTargetRepository = context.repo;
 
-            // Skip if comment does not start with '/bkbot'
+            // 如果评论不是以 '/bkbot' 开头，则跳过
             if (!commentBody.startsWith(botCommandPrefix)) {
               console.log('Not a bkbot command, skipping it ...');
               return;
             }
 
-            // Split comment by whitespace, extract command and parameter
-            // Only supports the following two forms:
+            // 将评论按空白分割，提取命令与参数
+            // 仅支持以下两种形式：
             //   /bkbot rerun
             //   /bkbot rerun <checkNameKeyword>
             const commands = commentBody.split(/\s+/);
             const botCommand = commands[1] || '';
 
-            // Only support the rerun command
+            // 只支持 rerun 命令
             if (botCommand !== 'rerun') {
               console.log(`Invalid bot command '${botCommand}', only 'rerun' is supported. Skip ...`);
               return;
             }
 
-            // If keyword is not provided, default to '_all' (rerun all failed workflows)
+            // 未提供关键字则默认 '_all'（重跑所有失败工作流）
             const checkName = (commands[2] && commands[2].trim()) ? commands[2].trim() : '_all';
 
-            // Get the Issue/PR number the comment belongs to
-            // Comments on PRs also trigger the issue_comment event
+            // 当前评论所在的 Issue/PR 编号（在 PR 上的评论同样属于 issue_comment 事件）
             const prNum = context.payload.issue.number;
 
-            // Get PR details (to retrieve headSha, branch, author, etc.)
+            // 获取 PR 详情（用于获取 headSha、分支、作者等信息）
             const { data: pr } = await github.rest.pulls.get({
               owner: botTargetRepository.owner,
               repo: botTargetRepository.repo,
               pull_number: prNum
             });
 
-            // Extract key PR info
-            const headSha = pr.head.sha;              // Latest commit SHA of PR
-            const prBranch = pr.head.ref;             // Head branch name of the PR
-            const prUser = pr.head.user.login;        // Username of PR author (for filtering)
-            const prHtmlUrl = pr.html_url;            // PR link
+            // 提取 PR 的关键信息
+            const headSha = pr.head.sha;              // 当前 PR 最新提交的 SHA
+            const prBranch = pr.head.ref;             // PR 的源分支名
+            const prUser = pr.head.user.login;        // 提交者用户名（用于过滤触发者）
+            const prHtmlUrl = pr.html_url;            // PR 链接
 
             console.log(`Handling bkbot command for PR #${prNum} ${prHtmlUrl}`);
 
-            // List workflow runs triggered by this user and branch in the repo
-            // Only keep runs matching the current headSha (to ensure the same CI round)
+            // 拉取该仓库中由该用户、该分支触发的工作流运行列表
+            // 然后仅保留与当前 headSha 匹配的运行
             let page = 1;
             let allRuns = [];
 
@@ -101,16 +100,16 @@ jobs:
               const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
                 owner: botTargetRepository.owner,
                 repo: botTargetRepository.repo,
-                actor: prUser,      // Only runs triggered by the PR author (reduce noise)
-                branch: prBranch,   // Only runs from this branch
+                actor: prUser,      // 仅看该 PR 作者触发的 runs（可减少干扰）
+                branch: prBranch,   // 仅看该分支
                 per_page: 100,
                 page: page
               });
 
-              // Filter runs whose head_sha matches current PR (ensure same CI context)
+              // 仅保留与当前 headSha 匹配的运行（确保是同一轮 CI）
               const matchingRuns = runs.workflow_runs.filter(run => run.head_sha === headSha);
 
-              // If no runs match in the current page, we are done collecting
+              // 如果当前页没有匹配项，说明已收集完毕
               if (matchingRuns.length === 0) {
                 break;
               }
@@ -119,8 +118,8 @@ jobs:
               page++;
             }
 
-            // To only operate on the latest run for each workflow:
-            // Group by workflow_id, sort by creation time descending, keep the latest run per workflow
+            // 为了每个工作流只操作最新的一次运行：
+            // 先按 workflow_id 分组，再按创建时间降序排序，保留每个 workflow 的最新 run
             allRuns.sort((a, b) => {
               if (a.workflow_id !== b.workflow_id) {
                 return a.workflow_id - b.workflow_id;
@@ -128,7 +127,7 @@ jobs:
               return new Date(b.created_at) - new Date(a.created_at);
             });
 
-            // For each workflow_id, only keep the first one (latest)
+            // 过滤：每个 workflow_id 只保留第一个（即最新的）
             const latestRuns = [];
             const seenWorkflows = new Set();
 
@@ -139,22 +138,22 @@ jobs:
               }
             }
 
-            // Pick out runs whose conclusion is failure or cancelled
+            // 从最新的运行中找出结论为失败（failure）或取消（cancelled）的 run
             const failedRuns = latestRuns.filter(run =>
               run.conclusion === 'failure' || run.conclusion === 'cancelled'
             );
 
             let foundJobs = 0;
 
-            // Iterate failed runs:
-            // - If '_all': rerun all failed workflows
-            // - Else: only rerun workflows whose name contains the specified keyword
+            // 遍历失败的 runs：
+            // - 如果是 '_all'：重跑所有失败工作流
+            // - 否则：仅重跑名称包含指定关键字的工作流
             for (const run of failedRuns) {
               if (checkName === '_all' || (run.name && run.name.includes(checkName))) {
                 console.log(`rerun-failed-jobs for '${run.name}'. Follow progress at ${run.html_url}`);
 
                 try {
-                  // Call GitHub API to rerun failed jobs in the workflow run
+                  // 调用 GitHub API 重跑该工作流中失败的 job
                   await github.rest.actions.reRunWorkflowFailedJobs({
                     owner: botTargetRepository.owner,
                     repo: botTargetRepository.repo,
@@ -162,7 +161,7 @@ jobs:
                   });
                   foundJobs++;
                 } catch (error) {
-                  // If rerun fails, print error but continue processing other runs
+                  // 若重跑失败，打印错误信息，但不中断其他 run 的处理
                   console.log(`Failed to rerun workflow: ${error.message}`);
                 }
               } else {
@@ -170,8 +169,7 @@ jobs:
               }
             }
 
-            // If no failed runs found to rerun, output a warning;
-            // Otherwise, output the count of restarted jobs
+            // 总结输出：如果没找到可重跑的失败 run，给出提示；否则输出重启数量
             if (foundJobs === 0) {
               console.error(`Cannot find any failed workflow runs in PR #${prNum}. Re-running can only target completed workflows.`);
             } else {
