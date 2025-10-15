@@ -1,0 +1,179 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# Description (English comments):
+# This GitHub Actions workflow enables the use of the /bkbot command in PR/Issue comments to rerun failed CI workflow(s).
+# Supported commands:
+# - /bkbot rerun            => Rerun all failed workflows
+# - /bkbot rerun <keyword>  => Only rerun failed workflows whose name contains the given keyword
+# Only triggered when a new comment containing /bkbot is created.
+
+name: BookKeeper Bot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  bkbot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Only run if the event is issue_comment and the comment contains '/bkbot'
+    if: github.event_name == 'issue_comment' && contains(github.event.comment.body, '/bkbot')
+    steps:
+      - name: Execute bkbot command
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Read comment text and trim whitespace
+            const commentBody = context.payload.comment.body.trim();
+            // Bot command prefix
+            const botCommandPrefix = '/bkbot';
+            // Target repository info (owner/repo)
+            const botTargetRepository = context.repo;
+
+            // Skip if comment does not start with '/bkbot'
+            if (!commentBody.startsWith(botCommandPrefix)) {
+              console.log('Not a bkbot command, skipping it ...');
+              return;
+            }
+
+            // Split comment by whitespace, extract command and parameter
+            // Only supports the following two forms:
+            //   /bkbot rerun
+            //   /bkbot rerun <checkNameKeyword>
+            const commands = commentBody.split(/\s+/);
+            const botCommand = commands[1] || '';
+
+            // Only support the rerun command
+            if (botCommand !== 'rerun') {
+              console.log(`Invalid bot command '${botCommand}', only 'rerun' is supported. Skip ...`);
+              return;
+            }
+
+            // If keyword is not provided, default to '_all' (rerun all failed workflows)
+            const checkName = (commands[2] && commands[2].trim()) ? commands[2].trim() : '_all';
+
+            // Get the Issue/PR number the comment belongs to
+            // Comments on PRs also trigger the issue_comment event
+            const prNum = context.payload.issue.number;
+
+            // Get PR details (to retrieve headSha, branch, author, etc.)
+            const { data: pr } = await github.rest.pulls.get({
+              owner: botTargetRepository.owner,
+              repo: botTargetRepository.repo,
+              pull_number: prNum
+            });
+
+            // Extract key PR info
+            const headSha = pr.head.sha;              // Latest commit SHA of PR
+            const prBranch = pr.head.ref;             // Head branch name of the PR
+            const prUser = pr.head.user.login;        // Username of PR author (for filtering)
+            const prHtmlUrl = pr.html_url;            // PR link
+
+            console.log(`Handling bkbot command for PR #${prNum} ${prHtmlUrl}`);
+
+            // List workflow runs triggered by this user and branch in the repo
+            // Only keep runs matching the current headSha (to ensure the same CI round)
+            let page = 1;
+            let allRuns = [];
+
+            while (true) {
+              const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
+                owner: botTargetRepository.owner,
+                repo: botTargetRepository.repo,
+                actor: prUser,      // Only runs triggered by the PR author (reduce noise)
+                branch: prBranch,   // Only runs from this branch
+                per_page: 100,
+                page: page
+              });
+
+              // Filter runs whose head_sha matches current PR (ensure same CI context)
+              const matchingRuns = runs.workflow_runs.filter(run => run.head_sha === headSha);
+
+              // If no runs match in the current page, we are done collecting
+              if (matchingRuns.length === 0) {
+                break;
+              }
+
+              allRuns.push(...matchingRuns);
+              page++;
+            }
+
+            // To only operate on the latest run for each workflow:
+            // Group by workflow_id, sort by creation time descending, keep the latest run per workflow
+            allRuns.sort((a, b) => {
+              if (a.workflow_id !== b.workflow_id) {
+                return a.workflow_id - b.workflow_id;
+              }
+              return new Date(b.created_at) - new Date(a.created_at);
+            });
+
+            // For each workflow_id, only keep the first one (latest)
+            const latestRuns = [];
+            const seenWorkflows = new Set();
+
+            for (const run of allRuns) {
+              if (!seenWorkflows.has(run.workflow_id)) {
+                seenWorkflows.add(run.workflow_id);
+                latestRuns.push(run);
+              }
+            }
+
+            // Pick out runs whose conclusion is failure or cancelled
+            const failedRuns = latestRuns.filter(run =>
+              run.conclusion === 'failure' || run.conclusion === 'cancelled'
+            );
+
+            let foundJobs = 0;
+
+            // Iterate failed runs:
+            // - If '_all': rerun all failed workflows
+            // - Else: only rerun workflows whose name contains the specified keyword
+            for (const run of failedRuns) {
+              if (checkName === '_all' || (run.name && run.name.includes(checkName))) {
+                console.log(`rerun-failed-jobs for '${run.name}'. Follow progress at ${run.html_url}`);
+
+                try {
+                  // Call GitHub API to rerun failed jobs in the workflow run
+                  await github.rest.actions.reRunWorkflowFailedJobs({
+                    owner: botTargetRepository.owner,
+                    repo: botTargetRepository.repo,
+                    run_id: run.id
+                  });
+                  foundJobs++;
+                } catch (error) {
+                  // If rerun fails, print error but continue processing other runs
+                  console.log(`Failed to rerun workflow: ${error.message}`);
+                }
+              } else {
+                console.log(`Expect ${checkName}, skipping build job '${run.name}' (${run.html_url})`);
+              }
+            }
+
+            // If no failed runs found to rerun, output a warning;
+            // Otherwise, output the count of restarted jobs
+            if (foundJobs === 0) {
+              console.error(`Cannot find any failed workflow runs in PR #${prNum}. Re-running can only target completed workflows.`);
+            } else {
+              console.log(`Finished. Restarted ${foundJobs} job(s).`);
+            }
