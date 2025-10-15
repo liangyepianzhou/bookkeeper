@@ -38,7 +38,6 @@ jobs:
   bkbot:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # 仅当事件为 issue_comment 且评论内容包含 '/bkbot' 时才运行
     if: github.event_name == 'issue_comment' && contains(github.event.comment.body, '/bkbot')
     steps:
       - name: Execute bkbot command
@@ -46,39 +45,27 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // 读取评论文本并去除首尾空白
             const commentBody = context.payload.comment.body.trim();
-            // 机器人命令前缀
             const botCommandPrefix = '/bkbot';
-            // 目标仓库信息（owner/repo）
             const botTargetRepository = context.repo;
             
-            // 如果评论不是以 '/bkbot' 开头，则跳过
             if (!commentBody.startsWith(botCommandPrefix)) {
               console.log('Not a bkbot command, skipping it ...');
               return;
             }
             
-            // 将评论按空白分割，提取命令与参数
-            // 仅支持以下两种形式：
-            //   /bkbot rerun
-            //   /bkbot rerun <checkNameKeyword>
             const commands = commentBody.split(/\s+/);
             const botCommand = commands[1] || '';
-            
-            // 只支持 rerun 命令
             if (botCommand !== 'rerun') {
               console.log(`Invalid bot command '${botCommand}', only 'rerun' is supported. Skip ...`);
               return;
             }
             
-            // 未提供关键字则默认 '_all'
-            const checkName = (commands[2] && commands[2].trim()) ? commands[2].trim() : '_all';
+            // 关键字支持多词：把第3个及之后的 token 合并
+            const checkName = (commands.length > 2) ? commands.slice(2).join(' ').trim() : '_all';
             
-            // 当前评论所在的 Issue/PR 编号（在 PR 上的评论同样属于 issue_comment 事件）
             const prNum = context.payload.issue.number;
             
-            // 获取 PR 详情（用于获取 headSha、分支、作者等信息）
             let pr;
             try {
               ({ data: pr } = await github.rest.pulls.get({
@@ -91,59 +78,44 @@ jobs:
               return;
             }
             
-            // 提取 PR 的关键信息
-            const headSha = pr.head.sha;              // 当前 PR 最新提交的 SHA
-            const prBranch = pr.head.ref;             // PR 的源分支名
-            // 某些场景 pr.head.user 可能为空，这里退回到 pr.user
+            const headSha = pr.head.sha;
+            const prBranch = pr.head.ref;
             const prUser = (pr.head && pr.head.user && pr.head.user.login) ? pr.head.user.login : pr.user.login;
-            const prHtmlUrl = pr.html_url;            // PR 链接
+            const prHtmlUrl = pr.html_url;
             
             console.log(`Handling bkbot command for PR #${prNum} ${prHtmlUrl} | keyword: ${checkName}`);
             
-            // 拉取该仓库中由该用户、该分支触发的工作流运行列表
-            // 然后仅保留与当前 headSha 匹配的运行
+            // 获取同一作者+分支的 runs，后续再按 headSha 过滤
             let page = 1;
             let allRunsRaw = [];
-            
             while (true) {
               const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
                 owner: botTargetRepository.owner,
                 repo: botTargetRepository.repo,
-                actor: prUser,      // 仅看该 PR 作者触发的 runs（可减少干扰）
-                branch: prBranch,   // 仅看该分支
+                actor: prUser,
+                branch: prBranch,
                 per_page: 100,
-                page: page
+                page
               });
-            
               const wr = runs.workflow_runs || [];
-              if (wr.length === 0) {
-                break;
-              }
+              if (wr.length === 0) break;
               allRunsRaw.push(...wr);
               page++;
             }
             
-            // 仅保留与当前 headSha 匹配的运行（确保是同一轮 CI）
             const allRuns = allRunsRaw.filter(run => run.head_sha === headSha);
-            
             if (allRuns.length === 0) {
               console.error(`No workflow runs found for head SHA ${headSha} on branch ${prBranch}. Nothing to rerun.`);
               return;
             }
             
-            // 为了每个工作流只操作最新的一次运行：
-            // 先按 workflow_id 分组，再按创建时间降序排序，保留每个 workflow 的最新 run
+            // 每个 workflow 只保留最新一次
             allRuns.sort((a, b) => {
-              if (a.workflow_id !== b.workflow_id) {
-                return a.workflow_id - b.workflow_id;
-              }
+              if (a.workflow_id !== b.workflow_id) return a.workflow_id - b.workflow_id;
               return new Date(b.created_at) - new Date(a.created_at);
             });
-            
-            // 过滤：每个 workflow_id 只保留第一个（即最新的）
             const latestRuns = [];
             const seenWorkflows = new Set();
-            
             for (const run of allRuns) {
               if (!seenWorkflows.has(run.workflow_id)) {
                 seenWorkflows.add(run.workflow_id);
@@ -151,7 +123,6 @@ jobs:
               }
             }
             
-            // 工具函数：列出指定 run 的所有 job（分页）
             async function listAllJobsForRun(runId) {
               let jobs = [];
               let jobPage = 1;
@@ -172,7 +143,6 @@ jobs:
               return jobs;
             }
             
-            // 工具函数：重跑单个 job（兼容旧版路由）
             async function rerunSingleJob(jobId, jobName, runName, runUrl) {
               try {
                 if (github.rest.actions.reRunJobForWorkflowRun) {
@@ -191,15 +161,14 @@ jobs:
                 console.log(`Re-ran job '${jobName}' (job_id: ${jobId}) in run '${runName}'. Follow progress at ${runUrl}`);
                 return true;
               } catch (error) {
-                console.log(`Failed to rerun job '${jobName}' (job_id: ${jobId}): ${error.message}`);
+                console.log(`Failed to rerun job '${jobName}' (job_id: ${jobId}) in run '${runName}': ${error.message}`);
                 return false;
               }
             }
             
-            // 目标结论集合（工作流与 job 统一）
             const TARGET_CONCLUSIONS = new Set(['failure', 'cancelled', 'timed_out', 'skipped']);
             
-            // 日志 1：打印所有“失败/取消/超时/跳过”的工作流运行（仅针对每个 workflow 的最新一次）
+            // 日志 1：失败/取消/超时/跳过 的工作流运行（仅最新一次）
             const interestingRuns = latestRuns.filter(run => TARGET_CONCLUSIONS.has(run.conclusion));
             console.log('--- Failed/Cancelled/Timed-out/Skipped workflow runs (latest per workflow for this head SHA) ---');
             if (interestingRuns.length === 0) {
@@ -210,9 +179,7 @@ jobs:
               }
             }
             
-            // 日志 2：打印“失败/取消/超时/跳过”的 jobs
-            // 范围：从所有 latestRuns 中扫描（包含正在运行中的工作流），
-            // 以便捕获运行过程中已经失败或跳过的 jobs。
+            // 日志 2：失败/取消/超时/跳过 的 jobs（从所有 latestRuns 扫描，含进行中的运行）
             const failedJobsLog = [];
             for (const run of latestRuns) {
               try {
@@ -242,13 +209,11 @@ jobs:
               }
             }
             
-            // 新的计数器
-            let rerunWorkflowAllCount = 0;   // 整条工作流运行重跑次数
-            let rerunMatchedJobsCount = 0;   // 通过关键字匹配到的 job 重跑次数
+            let rerunWorkflowAllCount = 0;
+            let rerunMatchedJobsCount = 0;
             
             if (checkName === '_all') {
-              // 情况 1：未指定 job（默认 _all）
-              // 仅重跑结论为 failure/cancelled/timed_out/skipped 的最新工作流运行（整条 run）
+              // 未指定关键字：仅重跑 failure/cancelled/timed_out/skipped 的运行（整条 run）
               const runsToRerun = latestRuns.filter(run => TARGET_CONCLUSIONS.has(run.conclusion));
             
               if (runsToRerun.length === 0) {
@@ -256,7 +221,6 @@ jobs:
               } else {
                 for (const run of runsToRerun) {
                   try {
-                    // 兼容 Octokit 的方法名差异：优先用 rest 接口，失败则回退到 github.request
                     if (github.rest.actions.reRunWorkflow) {
                       await github.rest.actions.reRunWorkflow({
                         owner: botTargetRepository.owner,
@@ -278,55 +242,51 @@ jobs:
                 }
               }
             } else {
-              // 情况 2：指定了 job 关键字
-              // 不管什么状态的工作流和 job 都获取，然后筛选符合条件的 job 重新运行
+              // 指定关键字：不论状态先获取并匹配，run 未完成则跳过并给出明确提示
               console.log(`Job keyword specified: '${checkName}'. Will scan all latest workflow runs and try to re-run matching jobs.`);
             
+              let matchedJobsFound = 0;
+              let matchedJobsInNonCompletedRuns = 0;
+            
               for (const run of latestRuns) {
+                let jobs;
                 try {
-                  const jobs = await listAllJobsForRun(run.id);
-                  if (!jobs || jobs.length === 0) {
-                    console.log(`No jobs found for run '${run.name}' (${run.html_url}).`);
+                  jobs = await listAllJobsForRun(run.id);
+                } catch (error) {
+                  console.log(`Failed to list jobs for run '${run.name}' (${run.html_url}): ${error.message}`);
+                  continue;
+                }
+                if (!jobs || jobs.length === 0) {
+                  console.log(`No jobs found for run '${run.name}' (${run.html_url}).`);
+                  continue;
+                }
+            
+                for (const job of jobs) {
+                  const isNameMatched = job.name && job.name.includes(checkName);
+                  if (!isNameMatched) continue;
+            
+                  matchedJobsFound++;
+            
+                  // GitHub API 限制：只有当 workflow run.status === 'completed' 时才能重跑 job
+                  if (run.status !== 'completed') {
+                    matchedJobsInNonCompletedRuns++;
+                    console.log(`Skip re-run for job '${job.name}' (job_id=${job.id}) in run '${run.name}' because the workflow run status is '${run.status}'. Try again after it completes. URL: ${job.html_url || run.html_url}`);
                     continue;
                   }
             
-                  for (const job of jobs) {
-                    const isNameMatched = job.name && job.name.includes(checkName);
-                    if (!isNameMatched) continue;
-            
-                    try {
-                      // 重跑单个 job（不关心其结论状态，直接尝试）
-                      if (github.rest.actions.reRunJobForWorkflowRun) {
-                        await github.rest.actions.reRunJobForWorkflowRun({
-                          owner: botTargetRepository.owner,
-                          repo: botTargetRepository.repo,
-                          job_id: job.id
-                        });
-                      } else {
-                        await github.request('POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun', {
-                          owner: botTargetRepository.owner,
-                          repo: botTargetRepository.repo,
-                          job_id: job.id
-                        });
-                      }
-                      rerunMatchedJobsCount++;
-                      console.log(`Re-ran job '${job.name}' (job_id=${job.id}) in run '${run.name}'. Follow progress at ${job.html_url || run.html_url}`);
-                    } catch (error) {
-                      // 例如 run 尚未 completed 时可能报错，这里仅记录日志并继续
-                      console.log(`Failed to re-run job '${job.name}' (job_id=${job.id}) in run '${run.name}': ${error.message}`);
-                    }
-                  }
-                } catch (error) {
-                  console.log(`Failed to list jobs for run '${run.name}' (${run.html_url}): ${error.message}`);
+                  const ok = await rerunSingleJob(job.id, job.name, run.name, job.html_url || run.html_url);
+                  if (ok) rerunMatchedJobsCount++;
                 }
               }
             
-              if (rerunMatchedJobsCount === 0) {
+              if (matchedJobsFound === 0) {
                 console.error(`No jobs matched keyword '${checkName}' in latest runs for head SHA ${headSha}.`);
+              } else if (rerunMatchedJobsCount === 0) {
+                console.error(`Matched ${matchedJobsFound} job(s) for keyword '${checkName}', but none were re-ran. ${matchedJobsInNonCompletedRuns > 0 ? matchedJobsInNonCompletedRuns + ' job(s) belong to runs that are not completed yet.' : ''} Try again after the workflow run finishes.`);
               }
             }
             
-            // 总结输出
+            // 总结
             if (checkName === '_all') {
               if (rerunWorkflowAllCount === 0) {
                 console.error(`No workflow runs were re-ran for PR #${prNum} (failure/cancelled/timed_out/skipped).`);
@@ -334,5 +294,4 @@ jobs:
                 console.log(`Finished. Re-ran ${rerunWorkflowAllCount} entire workflow run(s) (failure/cancelled/timed_out/skipped).`);
               }
             } else {
-              console.log(`Finished. Re-ran ${rerunMatchedJobsCount} job(s) that matched keyword '${checkName}'.`);
-            }
+              console.log(`Finished. Re-ran ${rerunMatchedJobsCount} job(s) that matched keyword '${checkName}'.`)
