@@ -11,17 +11,17 @@
 # Unless required by applicable law or agreed to in writing,
 # software distributed under the License is distributed on an
 # "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the LICENSE for the
+# KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
 #
 # 说明（中文注释）：
 # 该 GitHub Actions 工作流用于在 PR/Issue 评论中使用命令 /bkbot 来重跑 CI。
 # 仅支持命令：/bkbot rerun [关键字]
-# - /bkbot rerun            => 重跑同一 head SHA 下各工作流的最新一次运行，且仅限结论为 failure、cancelled、timed_out 的运行（整条 run）
+# - /bkbot rerun            => 重跑同一 head SHA 下各工作流的最新一次运行，且仅限结论为 failure/cancelled/timed_out/skipped 的运行（整条 run）
 # - /bkbot rerun <关键字>    => 不限工作流/Job 状态，获取最新运行中的全部 Job，按名称匹配关键字后逐个重跑
 # 日志说明：
-# - 失败/取消/超时的 jobs 会从“所有最新工作流运行”中扫描（包含 in_progress 的运行），从而捕获运行中途已失败的 jobs。
+# - 失败/取消/超时/跳过 的 jobs 会从“所有最新工作流运行”中扫描（包含 in_progress 的运行），从而捕获运行中途已失败或跳过的 jobs。
 # 触发条件：当新评论创建且包含 /bkbot 时触发。
 
 name: BookKeeper Bot
@@ -196,11 +196,12 @@ jobs:
               }
             }
             
-            // 日志 1：打印所有“失败/取消/超时”的工作流运行（仅针对每个 workflow 的最新一次）
-            const interestingRuns = latestRuns.filter(run =>
-              ['failure', 'cancelled', 'timed_out'].includes(run.conclusion)
-            );
-            console.log('--- Failed/Cancelled/Timed-out workflow runs (latest per workflow for this head SHA) ---');
+            // 目标结论集合（工作流与 job 统一）
+            const TARGET_CONCLUSIONS = new Set(['failure', 'cancelled', 'timed_out', 'skipped']);
+            
+            // 日志 1：打印所有“失败/取消/超时/跳过”的工作流运行（仅针对每个 workflow 的最新一次）
+            const interestingRuns = latestRuns.filter(run => TARGET_CONCLUSIONS.has(run.conclusion));
+            console.log('--- Failed/Cancelled/Timed-out/Skipped workflow runs (latest per workflow for this head SHA) ---');
             if (interestingRuns.length === 0) {
               console.log('None');
             } else {
@@ -209,15 +210,15 @@ jobs:
               }
             }
             
-            // 日志 2：打印“失败/取消/超时”的 jobs
-            // 范围扩大：从所有 latestRuns 中扫描（包含正在运行中的工作流），
-            // 以便捕获运行过程中已经失败的 jobs。
+            // 日志 2：打印“失败/取消/超时/跳过”的 jobs
+            // 范围：从所有 latestRuns 中扫描（包含正在运行中的工作流），
+            // 以便捕获运行过程中已经失败或跳过的 jobs。
             const failedJobsLog = [];
             for (const run of latestRuns) {
               try {
                 const jobs = await listAllJobsForRun(run.id);
                 for (const job of jobs) {
-                  if (['failure', 'cancelled', 'timed_out'].includes(job.conclusion)) {
+                  if (TARGET_CONCLUSIONS.has(job.conclusion)) {
                     failedJobsLog.push({
                       job_id: job.id,
                       job_name: job.name,
@@ -232,7 +233,7 @@ jobs:
                 console.log(`Failed to list jobs for run '${run.name}': ${error.message}`);
               }
             }
-            console.log('--- Failed/Cancelled/Timed-out jobs (scanned from all latest runs, including in-progress) ---');
+            console.log('--- Failed/Cancelled/Timed-out/Skipped jobs (scanned from all latest runs, including in-progress) ---');
             if (failedJobsLog.length === 0) {
               console.log('None');
             } else {
@@ -247,13 +248,11 @@ jobs:
             
             if (checkName === '_all') {
               // 情况 1：未指定 job（默认 _all）
-              // 仅重跑结论为 failure、cancelled、timed_out 的最新工作流运行（整条 run）
-              const runsToRerun = latestRuns.filter(run =>
-                ['failure', 'cancelled', 'timed_out'].includes(run.conclusion)
-              );
+              // 仅重跑结论为 failure/cancelled/timed_out/skipped 的最新工作流运行（整条 run）
+              const runsToRerun = latestRuns.filter(run => TARGET_CONCLUSIONS.has(run.conclusion));
             
               if (runsToRerun.length === 0) {
-                console.log('No failure/cancelled/timed_out workflow runs found to rerun. Nothing to do.');
+                console.log('No failure/cancelled/timed_out/skipped workflow runs found to rerun. Nothing to do.');
               } else {
                 for (const run of runsToRerun) {
                   try {
@@ -280,7 +279,7 @@ jobs:
               }
             } else {
               // 情况 2：指定了 job 关键字
-              // 不管什么状态的工作流和 job 都获取一下，然后筛选符合条件的 job 重新运行
+              // 不管什么状态的工作流和 job 都获取，然后筛选符合条件的 job 重新运行
               console.log(`Job keyword specified: '${checkName}'. Will scan all latest workflow runs and try to re-run matching jobs.`);
             
               for (const run of latestRuns) {
@@ -330,9 +329,9 @@ jobs:
             // 总结输出
             if (checkName === '_all') {
               if (rerunWorkflowAllCount === 0) {
-                console.error(`No workflow runs were re-ran for PR #${prNum} (failure/cancelled/timed_out).`);
+                console.error(`No workflow runs were re-ran for PR #${prNum} (failure/cancelled/timed_out/skipped).`);
               } else {
-                console.log(`Finished. Re-ran ${rerunWorkflowAllCount} entire workflow run(s) (failure/cancelled/timed_out).`);
+                console.log(`Finished. Re-ran ${rerunWorkflowAllCount} entire workflow run(s) (failure/cancelled/timed_out/skipped).`);
               }
             } else {
               console.log(`Finished. Re-ran ${rerunMatchedJobsCount} job(s) that matched keyword '${checkName}'.`);
